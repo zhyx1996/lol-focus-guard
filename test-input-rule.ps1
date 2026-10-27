@@ -1,0 +1,113 @@
+# 用稳定的测试窗口验证"输入判据"：
+#  A) 用户点击目标窗口 → 放行
+#  B) 目标窗口无输入自己抢前台（写 flag 触发）→ 拦截
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class T4 {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint c);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public MOUSEINPUT mi; }
+  [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  public static IntPtr FindByPid(int pid) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows(delegate(IntPtr h, IntPtr l) {
+      if (GetWindow(h, 4) != IntPtr.Zero) return true;
+      uint p; GetWindowThreadProcessId(h, out p);
+      if ((int)p == pid && IsWindowVisible(h)) { found = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+  public static void ClickAt(int x, int y) {
+    SetCursorPos(x, y);
+    System.Threading.Thread.Sleep(80);
+    INPUT[] d = new INPUT[1]; d[0].type = 0; d[0].mi.dwFlags = 0x0002;
+    INPUT[] u = new INPUT[1]; u[0].type = 0; u[0].mi.dwFlags = 0x0004;
+    SendInput(1, d, Marshal.SizeOf(typeof(INPUT)));
+    System.Threading.Thread.Sleep(50);
+    SendInput(1, u, Marshal.SizeOf(typeof(INPUT)));
+  }
+  public static string FgProc() {
+    uint pid; GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+    try { return System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; } catch { return "?"; }
+  }
+}
+'@
+
+$csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+& $csc /nologo /target:winexe /optimize+ /out:BgWin.exe /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll PopTarget.cs | Out-Null
+Copy-Item .\BgWin.exe .\PopTarget.exe -Force
+
+$guardLog = Join-Path $env:LOCALAPPDATA 'LolFocusGuard\guard.log'
+$flag = Join-Path $env:TEMP 'poptarget.flag'
+Get-Process LolFocusGuard, PopTarget, BgWin -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 500
+Remove-Item $guardLog, $flag -ErrorAction SilentlyContinue
+
+$bg = Start-Process (Join-Path $PSScriptRoot 'BgWin.exe') -ArgumentList 'bg' -PassThru
+$pt = Start-Process (Join-Path $PSScriptRoot 'PopTarget.exe') -ArgumentList 'target' -PassThru
+Start-Sleep -Seconds 2
+$bgH = [T4]::FindByPid($bg.Id)
+$ptH = [T4]::FindByPid($pt.Id)
+"BgWin hwnd=$bgH  PopTarget hwnd=$ptH"
+
+$guard = Start-Process (Join-Path $PSScriptRoot 'LolFocusGuard.exe') -ArgumentList '--targets=PopTarget','--verbose' -PassThru
+Start-Sleep -Seconds 2
+
+# 先把 BgWin 提到前台（脚本调用，不算目标）
+[void][T4]::SetForegroundWindow($bgH)
+Start-Sleep -Milliseconds 400
+"点击前前台 = $([T4]::FgProc())"
+
+# --- A) 模拟用户点击 PopTarget 窗口 ---
+# 先把它抬到最上面（不激活），保证点击落在它身上
+[void][T4]::SetWindowPos($ptH, [IntPtr]::Zero, 0, 0, 0, 0, 0x0013)
+Start-Sleep -Milliseconds 300
+$r = New-Object T4+RECT
+[void][T4]::GetWindowRect($ptH, [ref]$r)
+$cx = [int](($r.Left + $r.Right) / 2)
+$cy = [int](($r.Top + $r.Bottom) / 2)
+$before = (Get-Content $guardLog -Raw).Length
+[T4]::ClickAt($cx, $cy)
+Start-Sleep -Seconds 2
+$now = Get-Content $guardLog -Raw
+$partA = $now.Substring([Math]::Min($before, $now.Length))
+"=== A) 点击 PopTarget 之后 ==="
+($partA -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6)
+# 判定：点击造成的那次前台切换（有输入=True）紧跟的下一行不能是"拦截 #"
+$lines = @($partA -split "`r?`n" | Where-Object { $_.Trim() })
+$idx = -1
+for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '前台变化 → PopTarget' -and $lines[$i] -match '有输入=True') { $idx = $i; break }
+}
+if ($idx -lt 0) { 'A 结果: 未知（点击没产生前台切换，看上面日志）' }
+elseif ($idx + 1 -lt $lines.Count -and $lines[$idx + 1] -match '拦截 #') { 'A 结果: FAIL（用户点击被拦了）' }
+else { 'A 结果: PASS（点击被识别为用户操作，未拦）' }
+# --- B) 目标窗口自己抢前台（无输入）---
+[void][T4]::SetForegroundWindow($bgH)
+Start-Sleep -Milliseconds 500
+"B) 触发前前台 = $([T4]::FgProc())"
+$before = (Get-Content $guardLog -Raw).Length
+Set-Content -Path $flag -Value 'pop'
+Start-Sleep -Seconds 3
+Remove-Item $flag -ErrorAction SilentlyContinue
+$now = Get-Content $guardLog -Raw
+$partB = $now.Substring([Math]::Min($before, $now.Length))
+"=== B) 目标窗口自己弹前台之后 ==="
+($partB -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6)
+$blockedB = ([regex]::Matches($partB, '拦截 #')).Count
+if ($blockedB -ge 1) { 'B 结果: PASS（无输入的强制抢前台被拦）' } else { 'B 结果: FAIL（没拦）' }
+
+Stop-Process -Id $guard.Id, $bg.Id, $pt.Id -Force -ErrorAction SilentlyContinue

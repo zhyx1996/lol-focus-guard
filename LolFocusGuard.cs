@@ -75,6 +75,12 @@ namespace LolFocusGuard
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
 
+        // 关键：让本进程变成 DPI 感知，否则在缩放 125%/150% 的屏幕上，
+        // 低级钩子给的物理坐标和 WindowFromPoint 用的逻辑坐标对不上，
+        // 会算错"鼠标点在了哪个窗口上"。
+        [DllImport("user32.dll")]
+        public static extern bool SetProcessDPIAware();
+
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
@@ -123,6 +129,51 @@ namespace LolFocusGuard
         public const int WM_HOTKEY = 0x0312;
         public const uint MOD_ALT = 0x0001;
         public const uint MOD_CONTROL = 0x0002;
+
+        // ---- 低级输入钩子（WH_MOUSE_LL / WH_KEYBOARD_LL）：不注入，回调跑在我们自己线程里 ----
+        public const int WH_KEYBOARD_LL = 13;
+        public const int WH_MOUSE_LL = 14;
+        public const int WM_LBUTTONDOWN = 0x0201;
+        public const int WM_RBUTTONDOWN = 0x0204;
+        public const int WM_MBUTTONDOWN = 0x0207;
+        public const int WM_XBUTTONDOWN = 0x020B;
+        public const int WM_MOUSEWHEEL = 0x020A;
+        public const int WM_KEYDOWN = 0x0100;
+        public const int WM_SYSKEYDOWN = 0x0104;
+
+        public delegate IntPtr LowLevelHookProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelHookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+        public static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSLLHOOKSTRUCT
+        {
+            public POINT pt;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
     }
 
     /// <summary>核心守卫逻辑：装前台事件钩子 + 记录"谁在抢前台" + 抢回时立刻打回去。</summary>
@@ -152,7 +203,6 @@ namespace LolFocusGuard
         private DateTime _resumeAt = DateTime.MinValue;
         private DateTime _lastClickAt = DateTime.MinValue;
         private string _lastClickProc = string.Empty;
-        private bool _wasDown;
         private int _blockCount;
         private DateTime _lastIconicAt = DateTime.MinValue;
         // 每个目标窗口"上一次处于最小化"的时间，用来判断弹出来的那一刻它是不是从最小化状态恢复的
@@ -191,6 +241,17 @@ namespace LolFocusGuard
         // 已经见过的目标窗口（只放过"第一次出现"的窗口）
         private readonly HashSet<IntPtr> _knownWindows = new HashSet<IntPtr>();
 
+        // ---- 低级输入钩子：区分"你自己切过去的"和"进程强制抢前台" ----
+        private const int INPUT_GRACE_MS = 500; // 最后一次输入后多久内算"用户操作引起"
+        private IntPtr _mouseHook = IntPtr.Zero;
+        private IntPtr _kbdHook = IntPtr.Zero;
+        private Native.LowLevelHookProc _mouseProc;
+        private Native.LowLevelHookProc _kbdProc;
+        private DateTime _lastInputAt = DateTime.MinValue;
+        private bool _lastInputIsKey;
+        private string _lastInputWhere = string.Empty; // 鼠标按下时指针压在哪个进程的窗口上
+        private volatile bool _altDown;
+
         public Guard(IEnumerable<string> targets, string logPath, bool verbose, bool noClickAllow,
             IEnumerable<string> freshProcs, int freshSeconds, string lcuDir)
         {
@@ -228,6 +289,13 @@ namespace LolFocusGuard
                 }
             }
 
+            // 低级输入钩子：拿"用户到底有没有在操作"这个事实，用来区分强制抢前台和手动切换
+            _mouseProc = MouseHookProc;
+            _kbdProc = KeyboardHookProc;
+            IntPtr hMod = Native.GetModuleHandle(null);
+            _mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _mouseProc, hMod, 0);
+            _kbdHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, _kbdProc, hMod, 0);
+
             _pollThread = new System.Threading.Thread(PollLoop);
             _pollThread.IsBackground = true;
             _pollThread.Priority = System.Threading.ThreadPriority.AboveNormal;
@@ -241,7 +309,9 @@ namespace LolFocusGuard
             _actionThread.Start();
 
             // 守卫启动前就已经存在的目标窗口不算"第一次出现"
-            RefreshTarget(true);
+            // 注意：这里刻意不把启动时已存在的窗口标记为"见过"——
+            // 守卫如果是在登录页已经开出来之后才启动的，也应当放行一次。
+            RefreshTarget(false);
 
             Log("守卫启动，监控进程: " + string.Join(", ", _targets));
             if (_freshProcs.Count > 0)
@@ -250,6 +320,14 @@ namespace LolFocusGuard
                     string.Join(", ", _freshProcs), _freshSeconds));
             }
             if (_hook == IntPtr.Zero) Log("警告：SetWinEventHook 失败，无法监听前台切换");
+            if (_mouseHook == IntPtr.Zero || _kbdHook == IntPtr.Zero)
+            {
+                Log("警告：低级输入钩子安装失败，只能按「没输入就拦」的保守规则工作");
+            }
+            else
+            {
+                Log(string.Format("输入钩子已安装（{0}ms 内的输入算你自己操作）", INPUT_GRACE_MS));
+            }
         }
 
         public int BlockCount { get { return _blockCount; } }
@@ -319,15 +397,6 @@ namespace LolFocusGuard
                     }
                 }
 
-                // 记录鼠标按下：用来区分"用户点的"和"自己弹出来的"
-                bool down = IsMouseButtonDown();
-                if (down && !_wasDown)
-                {
-                    _lastClickAt = DateTime.Now;
-                    _lastClickProc = ProcUnderCursor();
-                }
-                _wasDown = down;
-
                 // 兜底：钩子偶尔会漏事件（系统抖动、快速连续切换），这里再按轮询查一遍
                 IntPtr fg = Native.GetForegroundWindow();
                 if (fg != _lastFgHwnd)
@@ -390,7 +459,7 @@ namespace LolFocusGuard
             }
         }
 
-        private static bool IsMouseButtonDown()
+        private static bool UnusedIsMouseButtonDown()
         {
             const int VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_MBUTTON = 0x04, VK_XBUTTON1 = 0x05, VK_XBUTTON2 = 0x06;
             return (Native.GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
@@ -799,7 +868,14 @@ namespace LolFocusGuard
 
                 if (_verbose)
                 {
-                    Log(string.Format("前台变化 → {0} (pid={1})", proc, ProcIdOf(hwnd)));
+                    Native.RECT vr;
+                    string size = Native.GetWindowRect(hwnd, out vr)
+                        ? string.Format("{0}x{1}@({2},{3})", vr.Right - vr.Left, vr.Bottom - vr.Top, vr.Left, vr.Top)
+                        : "?";
+                    Log(string.Format("前台变化 → {0} (pid={1}) class={2} 标题=\"{3}\" 尺寸={4} 最小化={5} 有输入={6}({7})",
+                        proc, ProcIdOf(hwnd), ClassNameOf(hwnd), TitleOf(hwnd), size,
+                        Native.IsIconic(hwnd),
+                        (DateTime.Now - _lastInputAt).TotalMilliseconds <= INPUT_GRACE_MS, _lastInputWhere));
                 }
 
                 if (!isTarget)
@@ -831,17 +907,11 @@ namespace LolFocusGuard
                     return;
                 }
 
-                // 客户端确定还没登录（LCU 接口 404）→ 登录页/安全检测阶段，一律放行
-                if (_loginState == 2 && IsClientProcess(proc))
+                // 客户端第一次冒出窗口（登录页 / 启动页 / 安全检测）：放行。
+                // 之后同一个窗口再跳前台（匹配成功那类）就按输入判据处理了。
+                if (IsFirstClientWindow(hwnd, proc))
                 {
-                    if (_verbose) Log("放行原因: 客户端还没登录（登录页阶段）");
-                    return;
-                }
-
-                // 客户端刚启动时第一次出现的窗口 = 登录页/启动页，放行（不然连登录都点不了）
-                if (IsStartupWindow(hwnd))
-                {
-                    if (_verbose) Log("放行原因: 客户端启动阶段的窗口（登录页）");
+                    if (_verbose) Log("放行原因: 客户端窗口第一次出现（登录页/启动页）");
                     return;
                 }
 
@@ -849,6 +919,26 @@ namespace LolFocusGuard
 
                 Block(hwnd);
             }
+        }
+
+        /// <summary>
+        /// 客户端进程的窗口第一次出现（登录页 / 启动页 / 安全检测）→ 放行。
+        /// 只对客户端进程有效：WeGame 的窗口另有规则（客户端没起来时全放行）。
+        /// </summary>
+        private bool IsFirstClientWindow(IntPtr hwnd, string proc)
+        {
+            if (!IsClientProcess(proc))
+            {
+                lock (_sync) { _knownWindows.Add(hwnd); }
+                return false;
+            }
+
+            lock (_sync)
+            {
+                if (_knownWindows.Contains(hwnd)) return false;
+                _knownWindows.Add(hwnd);
+            }
+            return true;
         }
 
         /// <summary>
@@ -887,35 +977,101 @@ namespace LolFocusGuard
             }
         }
 
-        /// <summary>判断这次前台切换是不是用户自己点的。</summary>
+        // ---------- 低级输入钩子 ----------
+        private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                int msg = wParam.ToInt32();
+                if (msg == Native.WM_LBUTTONDOWN || msg == Native.WM_RBUTTONDOWN ||
+                    msg == Native.WM_MBUTTONDOWN || msg == Native.WM_XBUTTONDOWN ||
+                    msg == Native.WM_MOUSEWHEEL)
+                {
+                    try
+                    {
+                        Native.MSLLHOOKSTRUCT info = (Native.MSLLHOOKSTRUCT)
+                            Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
+                        IntPtr under = Native.WindowFromPoint(info.pt);
+                        IntPtr root = Native.GetAncestor(under, Native.GA_ROOT);
+                        _lastInputWhere = ProcNameOf(root == IntPtr.Zero ? under : root);
+                    }
+                    catch
+                    {
+                        _lastInputWhere = string.Empty;
+                    }
+                    _lastInputIsKey = false;
+                    _lastInputAt = DateTime.Now;
+                }
+            }
+            return Native.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+        }
+
+        private IntPtr KeyboardHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                int msg = wParam.ToInt32();
+                try
+                {
+                    Native.KBDLLHOOKSTRUCT info = (Native.KBDLLHOOKSTRUCT)
+                        Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
+                    if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
+                    {
+                        _lastInputIsKey = true;
+                        _lastInputAt = DateTime.Now;
+                        if (info.vkCode == 0x12) _altDown = true; // VK_MENU
+                    }
+                    else if (msg == 0x0101 || msg == 0x0105) // KEYUP / SYSKEYUP
+                    {
+                        if (info.vkCode == 0x12) _altDown = false;
+                    }
+                }
+                catch
+                {
+                }
+            }
+            return Native.CallNextHookEx(_kbdHook, nCode, wParam, lParam);
+        }
+
+        /// <summary>判断这次前台切换是不是用户自己弄出来的。</summary>
         private bool ShouldAllow(IntPtr hwnd)
         {
-            // Alt 键按着（Alt+Tab）→ 放行
-            if ((Native.GetAsyncKeyState(Native.VK_MENU) & 0x8000) != 0)
+            if (_noClickAllow) return false; // 测试模式：忽略一切输入放行
+
+            // Alt 按着（Alt+Tab）→ 放行
+            if (_altDown || (Native.GetAsyncKeyState(Native.VK_MENU) & 0x8000) != 0)
             {
-                if (_verbose) Log("放行原因: Alt 键按下");
+                if (_verbose) Log("放行原因: Alt 按着（Alt+Tab）");
                 return true;
             }
 
-            // 用户点击判定：只有"按下的那一刻"指针确实在客户端/任务栏上，才算用户点的
-            // （避免窗口正好弹到鼠标底下被误判成"用户点的"）
-            string clickProc = ClickTargetProc();
-            if (clickProc.Length > 0)
+            double idle = (DateTime.Now - _lastInputAt).TotalMilliseconds;
+
+            // 最近有键盘输入 → 是你在切窗口（Alt+Tab、Win+数字、Alt+F4 之类）
+            if (idle <= INPUT_GRACE_MS && _lastInputIsKey)
             {
-                if (_targets.Contains(clickProc))
-                {
-                    if (_verbose) Log("放行原因: 用户点击了客户端（" + clickProc + "）");
-                    return true;
-                }
-                if (IsShellProcess(clickProc))
-                {
-                    if (_verbose) Log("放行原因: 用户点击了任务栏/开始菜单（" + clickProc + "）");
-                    return true;
-                }
+                if (_verbose) Log(string.Format("放行原因: {0}ms 前有键盘输入", (int)idle));
+                return true;
             }
 
-            // 没有可回退的前台窗口（刚开机 / 前一个窗口已关闭）也照样拦：
-            // 只最小化，不再恢复前台（见 Block 里的 restore 处理）
+            // 最近有鼠标点击，且按下的位置在被切过去的这个窗口自己身上 → 是你点的
+            if (idle <= INPUT_GRACE_MS && !_lastInputIsKey && _lastInputWhere.Length > 0)
+            {
+                if (_targets.Contains(_lastInputWhere))
+                {
+                    if (_verbose) Log("放行原因: 你点了这个窗口（" + _lastInputWhere + "）");
+                    return true;
+                }
+                if (IsShellProcess(_lastInputWhere))
+                {
+                    if (_verbose) Log("放行原因: 你点了任务栏/开始菜单（" + _lastInputWhere + "）");
+                    return true;
+                }
+                // 点在别的程序上（你正在打字/点游戏），这个窗口却跑到前台来了 = 它自己弹的
+            }
+
+            // 注意：这里刻意**不**用"指针此刻压在目标窗口上"放行。
+            // 鼠标可能只是随手停在那里（比如刚才点过它），窗口自己弹出来时会被误放行。
             return false;
         }
 
@@ -923,18 +1079,7 @@ namespace LolFocusGuard
         private string ClickTargetProc()
         {
             if (_noClickAllow) return string.Empty;
-            if (IsMouseButtonDown())
-            {
-                // 按键还按着：以当前指针位置为准
-                string now = ProcUnderCursor();
-                _lastClickAt = DateTime.Now;
-                _lastClickProc = now;
-                return now;
-            }
-            if ((DateTime.Now - _lastClickAt).TotalMilliseconds < 250)
-            {
-                return _lastClickProc;
-            }
+            if ((DateTime.Now - _lastInputAt).TotalMilliseconds < 250) return _lastInputWhere;
             return string.Empty;
         }
 
@@ -1164,6 +1309,16 @@ namespace LolFocusGuard
                 Native.UnhookWinEvent(_hook);
                 _hook = IntPtr.Zero;
             }
+            if (_mouseHook != IntPtr.Zero)
+            {
+                Native.UnhookWindowsHookEx(_mouseHook);
+                _mouseHook = IntPtr.Zero;
+            }
+            if (_kbdHook != IntPtr.Zero)
+            {
+                Native.UnhookWindowsHookEx(_kbdHook);
+                _kbdHook = IntPtr.Zero;
+            }
             _disposed = true;
             Log("守卫退出");
         }
@@ -1333,6 +1488,9 @@ namespace LolFocusGuard
         [STAThread]
         private static void Main(string[] args)
         {
+            try { Native.SetProcessDPIAware(); }
+            catch { }
+
             bool created;
             using (Mutex mutex = new Mutex(true, "LolFocusGuard.SingleInstance", out created))
             {
