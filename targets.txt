@@ -1,0 +1,11 @@
+# LolFocusGuard 监控名单：一行一个进程名（不带 .exe），# 开头是注释
+# 这些进程的窗口"自己弹到前台抢焦点"时会被打回去；你点它 / Alt+Tab 过去不会拦。
+# 改完重启程序生效（托盘右键退出，再双击 LolFocusGuard.exe）。
+
+# 英雄联盟客户端
+LeagueClientUx
+RiotClientServices
+
+# WeGame（启动、更新完成、启动游戏时的那一下抢焦点）
+wegame
+wegame_env

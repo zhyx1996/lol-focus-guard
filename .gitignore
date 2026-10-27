@@ -1,0 +1,9 @@
+# 编译产物
+*.exe
+
+# 本机配置（仓库里只保留示例）
+lcu-dir.txt
+
+# 运行时
+guard.log
+*.log

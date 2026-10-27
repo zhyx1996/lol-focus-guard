@@ -1,0 +1,8 @@
+# 客户端安装目录（里面应该有 lockfile），用于查"客户端登录了没有"。
+# 一行一个路径，# 开头是注释。
+#
+# 腾讯/WeGame 版常见：D:\WeGameApps\英雄联盟\LeagueClient
+# 拳头版常见：      C:\Riot Games\League of Legends
+#
+# 这个文件可以不存在：程序会自己从客户端进程目录、上面这两个常见路径里猜。
+# 也可以把它放在 LolFocusGuard.exe 旁边，文件名必须叫 lcu-dir.txt（UTF-8）。

@@ -1,0 +1,23 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译（系统自带 csc，无需 SDK）
+        shell: pwsh
+        run: ./build.ps1 -SkipStop
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: LolFocusGuard
+          path: LolFocusGuard.exe
