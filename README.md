@@ -70,6 +70,26 @@ pwsh ./build.ps1          # 会先结束正在运行的守卫，再编译
 | `--lcu-dir=<路径>` | 客户端安装目录（用来找 `lockfile`，只写日志，不参与判定） |
 | `--no-click-allow` | 关掉所有「你在操作」的放行（测试用，等于什么都拦） |
 | `--verbose` | 每次前台变化都写日志（含窗口类名/标题/尺寸/当次有没有输入，排查问题用） |
+| `--report` | 不开守卫，只把已有日志汇总成一份短报告（`%LOCALAPPDATA%\LolFocusGuard\report.txt`） |
+
+出问题的时候这样取证，比发整份日志方便：
+
+```powershell
+.\LolFocusGuard.exe --report
+notepad $env:LOCALAPPDATA\LolFocusGuard\report.txt
+```
+
+报告长这样：
+
+```
+时间范围: 2026-10-28 01:00:25 → 01:00:36
+拦截: 5 次
+  FakeClient / "FakeClient" ×5
+放行: 21 次
+  正在放弃拦截期 ×21
+放弃拦截（防拉锯，10 秒内拦 6 次就停手）: 1 次
+判为自弹的依据:「一直没有输入」5 次，「输入落在别的程序上」0 次
+```
 
 ### `lcu-dir.txt` — 登录状态检测
 

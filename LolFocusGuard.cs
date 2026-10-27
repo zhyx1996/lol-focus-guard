@@ -1554,11 +1554,190 @@ namespace LolFocusGuard
 
     internal static class Program
     {
+        /// <summary>
+        /// --report：把日志汇总成一份短报告（拦了多少次、都拦了谁、放行原因分布），
+        /// 出问题的时候把 report.txt 发出来就够了，不用整份日志。
+        /// </summary>
+        private static void RunReport(string logPath)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("LolFocusGuard 日志报告");
+            sb.AppendLine("日志: " + logPath);
+
+            if (!File.Exists(logPath))
+            {
+                sb.AppendLine("找不到日志文件。");
+                WriteReport(sb.ToString(), logPath);
+                return;
+            }
+
+            string[] lines;
+            try
+            {
+                lines = File.ReadAllLines(logPath, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                sb.AppendLine("读日志失败: " + ex.Message);
+                WriteReport(sb.ToString(), logPath);
+                return;
+            }
+
+            if (lines.Length == 0)
+            {
+                sb.AppendLine("日志是空的。");
+                WriteReport(sb.ToString(), logPath);
+                return;
+            }
+
+            string firstTime = null;
+            string lastTime = null;
+            int blockCount = 0;
+            int giveUpCount = 0;
+            int noInputCount = 0;
+            int inputElsewhereCount = 0;
+            Dictionary<string, int> blockedWindows = new Dictionary<string, int>();
+            Dictionary<string, int> allowReasons = new Dictionary<string, int>();
+
+            foreach (string raw in lines)
+            {
+                string line = raw;
+                if (line.Length < 26) continue;
+                if (line[0] == '[')
+                {
+                    string t = line.Substring(1, Math.Min(23, line.Length - 1));
+                    if (firstTime == null) firstTime = t;
+                    lastTime = t;
+                }
+
+                if (line.IndexOf("拦截 #", StringComparison.Ordinal) >= 0)
+                {
+                    blockCount++;
+                    string key = DescribeWindowFromLog(line, "拦截 #");
+                    if (key != null)
+                    {
+                        int n;
+                        blockedWindows.TryGetValue(key, out n);
+                        blockedWindows[key] = n + 1;
+                    }
+                }
+                else if (line.IndexOf("放弃拦截 60 秒", StringComparison.Ordinal) >= 0)
+                {
+                    giveUpCount++;
+                }
+                else if (line.IndexOf("放行原因: ", StringComparison.Ordinal) >= 0)
+                {
+                    string reason = line.Substring(line.IndexOf("放行原因: ", StringComparison.Ordinal) + "放行原因: ".Length).Trim();
+                    int cut = reason.IndexOf('（');
+                    if (cut > 0) reason = reason.Substring(0, cut);
+                    int n;
+                    allowReasons.TryGetValue(reason, out n);
+                    allowReasons[reason] = n + 1;
+                }
+                else if (line.IndexOf("不放行: ", StringComparison.Ordinal) >= 0)
+                {
+                    string why = line.Substring(line.IndexOf("不放行: ", StringComparison.Ordinal) + "不放行: ".Length).Trim();
+                    if (why.IndexOf("没有输入", StringComparison.Ordinal) >= 0) noInputCount++;
+                    else inputElsewhereCount++;
+                }
+            }
+
+            sb.AppendLine(string.Format("时间范围: {0} → {1}", firstTime, lastTime));
+            sb.AppendLine();
+            sb.AppendLine(string.Format("拦截: {0} 次", blockCount));
+            foreach (KeyValuePair<string, int> kv in blockedWindows)
+            {
+                sb.AppendLine(string.Format("  {0} ×{1}", kv.Key, kv.Value));
+            }
+            sb.AppendLine();
+            sb.AppendLine("放行: " + TotalOf(allowReasons) + " 次");
+            foreach (KeyValuePair<string, int> kv in allowReasons)
+            {
+                sb.AppendLine(string.Format("  {0} ×{1}", kv.Key, kv.Value));
+            }
+            sb.AppendLine();
+            sb.AppendLine(string.Format("放弃拦截（防拉锯，10 秒内拦 6 次就停手）: {0} 次", giveUpCount));
+            sb.AppendLine(string.Format("判为自弹的依据:「一直没有输入」{0} 次，「输入落在别的程序上」{1} 次",
+                noInputCount, inputElsewhereCount));
+
+            WriteReport(sb.ToString(), logPath);
+        }
+
+        private static int TotalOf(Dictionary<string, int> d)
+        {
+            int total = 0;
+            foreach (KeyValuePair<string, int> kv in d) total += kv.Value;
+            return total;
+        }
+
+        private static string DescribeWindowFromLog(string line, string prefix)
+        {
+            int i = line.IndexOf(prefix, StringComparison.Ordinal);
+            if (i < 0) return null;
+            int start = i + prefix.Length;
+            int colon = line.IndexOf('：', start);
+            if (colon < 0) return null;
+            int space = line.IndexOf(' ', colon + 1);
+            if (space < 0) return null;
+            string proc = line.Substring(colon + 1, space - colon - 1).Trim();
+            int q1 = line.IndexOf("标题=\"", space, StringComparison.Ordinal);
+            string title = "";
+            if (q1 >= 0)
+            {
+                int q2 = line.IndexOf('"', q1 + 4);
+                if (q2 > q1) title = line.Substring(q1 + 4, q2 - q1 - 4);
+            }
+            return title.Length > 0 ? proc + " / \"" + title + "\"" : proc;
+        }
+
+        private static void WriteReport(string text, string logPath)
+        {
+            string outPath = Path.Combine(Path.GetDirectoryName(logPath) ?? ".", "report.txt");
+            try
+            {
+                File.WriteAllText(outPath, text, new UTF8Encoding(false));
+            }
+            catch
+            {
+                outPath = Path.Combine(Path.GetTempPath(), "lfg-report.txt");
+                try { File.WriteAllText(outPath, text, new UTF8Encoding(false)); }
+                catch { }
+            }
+            try
+            {
+                Console.WriteLine(text);
+                Console.WriteLine("报告已写入: " + outPath);
+            }
+            catch
+            {
+            }
+        }
+
         [STAThread]
         private static void Main(string[] args)
         {
             try { Native.SetProcessDPIAware(); }
             catch { }
+
+            // --report：把日志汇总成一份人能看懂的报告，方便排查（不需要单实例，也不改任何状态）
+            if (args.Length > 0 && string.Equals(args[0], "--report", StringComparison.OrdinalIgnoreCase))
+            {
+                string logPath = null;
+                for (int i = 1; i < args.Length; i++)
+                {
+                    if (args[i].StartsWith("--log=", StringComparison.OrdinalIgnoreCase))
+                    {
+                        logPath = args[i].Substring("--log=".Length).Trim('"');
+                    }
+                }
+                if (logPath == null)
+                {
+                    logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "LolFocusGuard", "guard.log");
+                }
+                RunReport(logPath);
+                return;
+            }
 
             bool created;
             using (Mutex mutex = new Mutex(true, "LolFocusGuard.SingleInstance", out created))
