@@ -484,11 +484,24 @@ namespace LolFocusGuard
             string content;
             try
             {
-                content = File.ReadAllText(lockfile).Trim();
+                // 客户端是用独占方式打开 lockfile 的，File.ReadAllText（FileShare.Read）会报
+                // "being used by another process"，这里必须显式允许共享读写
+                using (FileStream fs = new FileStream(lockfile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (StreamReader sr = new StreamReader(fs))
+                {
+                    content = sr.ReadToEnd().Trim();
+                }
             }
             catch
             {
                 SetLoginState(0, "读不到 lockfile");
+                return;
+            }
+
+            // 客户端起来了但 lockfile 还是空文件 = LCU 还没就绪，人还在登录页
+            if (content.Length == 0)
+            {
+                SetLoginState(2, "lockfile 为空（客户端还没登录）");
                 return;
             }
 
