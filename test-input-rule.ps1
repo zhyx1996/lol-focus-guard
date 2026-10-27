@@ -1,6 +1,10 @@
-# 用稳定的测试窗口验证"输入判据"：
-#  A) 用户点击目标窗口 → 放行
-#  B) 目标窗口无输入自己抢前台（写 flag 触发）→ 拦截
+# 核心判据回归测试（不需要真客户端）
+#   A) 用户点击被监控窗口 → 必须放行
+#   B) 被监控窗口自己抢前台（无任何输入）→ 必须拦截
+#
+# 做法：现场把 PopTarget.cs 编译成两个程序（PopTarget / BgWin），
+# 用 SendInput 真点鼠标——低级鼠标钩子连 SendInput 造的事件也看得见，
+# 所以和真人点击走的是同一条代码路径。
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
 using System;
@@ -10,8 +14,6 @@ public class T4 {
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
   [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint c);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
@@ -39,6 +41,10 @@ public class T4 {
     System.Threading.Thread.Sleep(50);
     SendInput(1, u, Marshal.SizeOf(typeof(INPUT)));
   }
+  public static void ClickWindow(IntPtr h) {
+    RECT r; GetWindowRect(h, out r);
+    ClickAt((r.Left + r.Right) / 2, (r.Top + r.Bottom) / 2);
+  }
   public static string FgProc() {
     uint pid; GetWindowThreadProcessId(GetForegroundWindow(), out pid);
     try { return System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; } catch { return "?"; }
@@ -61,32 +67,24 @@ $pt = Start-Process (Join-Path $PSScriptRoot 'PopTarget.exe') -ArgumentList 'tar
 Start-Sleep -Seconds 2
 $bgH = [T4]::FindByPid($bg.Id)
 $ptH = [T4]::FindByPid($pt.Id)
-"BgWin hwnd=$bgH  PopTarget hwnd=$ptH"
+if ($bgH -eq [IntPtr]::Zero -or $ptH -eq [IntPtr]::Zero) { throw '测试窗口没起来' }
 
 $guard = Start-Process (Join-Path $PSScriptRoot 'LolFocusGuard.exe') -ArgumentList '--targets=PopTarget','--verbose' -PassThru
 Start-Sleep -Seconds 2
 
-# 先把 BgWin 提到前台（脚本调用，不算目标）
-[void][T4]::SetForegroundWindow($bgH)
-Start-Sleep -Milliseconds 400
+# ---------- A) 用户点击 PopTarget ----------
+# 先把焦点给对照组（也是真人式点击），再点被监控窗口 → 必须放行
+[T4]::ClickWindow($bgH)
+Start-Sleep -Milliseconds 800
 "点击前前台 = $([T4]::FgProc())"
-
-# --- A) 模拟用户点击 PopTarget 窗口 ---
-# 先把它抬到最上面（不激活），保证点击落在它身上
-[void][T4]::SetWindowPos($ptH, [IntPtr]::Zero, 0, 0, 0, 0, 0x0013)
-Start-Sleep -Milliseconds 300
-$r = New-Object T4+RECT
-[void][T4]::GetWindowRect($ptH, [ref]$r)
-$cx = [int](($r.Left + $r.Right) / 2)
-$cy = [int](($r.Top + $r.Bottom) / 2)
 $before = (Get-Content $guardLog -Raw).Length
-[T4]::ClickAt($cx, $cy)
+[T4]::ClickWindow($ptH)
 Start-Sleep -Seconds 2
 $now = Get-Content $guardLog -Raw
 $partA = $now.Substring([Math]::Min($before, $now.Length))
-"=== A) 点击 PopTarget 之后 ==="
+"=== A) 点击 PopTarget 之后的日志 ==="
 ($partA -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6)
-# 判定：点击造成的那次前台切换（有输入=True）紧跟的下一行不能是"拦截 #"
+
 $lines = @($partA -split "`r?`n" | Where-Object { $_.Trim() })
 $idx = -1
 for ($i = 0; $i -lt $lines.Count; $i++) {
@@ -95,19 +93,16 @@ for ($i = 0; $i -lt $lines.Count; $i++) {
 if ($idx -lt 0) { 'A 结果: 未知（点击没产生前台切换，看上面日志）' }
 elseif ($idx + 1 -lt $lines.Count -and $lines[$idx + 1] -match '拦截 #') { 'A 结果: FAIL（用户点击被拦了）' }
 else { 'A 结果: PASS（点击被识别为用户操作，未拦）' }
-# --- B) 目标窗口自己抢前台（无输入）---
-[void][T4]::SetForegroundWindow($bgH)
-Start-Sleep -Milliseconds 500
-"B) 触发前前台 = $([T4]::FgProc())"
+# ---------- B) PopTarget 自己抢前台（先最小化再恢复，保证有事件） ----------
 $before = (Get-Content $guardLog -Raw).Length
-Set-Content -Path $flag -Value 'pop'
+Set-Content -Path $flag -Value 'cycle'
 Start-Sleep -Seconds 3
 Remove-Item $flag -ErrorAction SilentlyContinue
 $now = Get-Content $guardLog -Raw
 $partB = $now.Substring([Math]::Min($before, $now.Length))
-"=== B) 目标窗口自己弹前台之后 ==="
+"=== B) PopTarget 自己抢前台之后的日志 ==="
 ($partB -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6)
-$blockedB = ([regex]::Matches($partB, '拦截 #')).Count
-if ($blockedB -ge 1) { 'B 结果: PASS（无输入的强制抢前台被拦）' } else { 'B 结果: FAIL（没拦）' }
+$blocked = ([regex]::Matches($partB, '拦截 #')).Count
+if ($blocked -ge 1) { 'B 结果: PASS（无输入的强制抢前台被拦）' } else { 'B 结果: FAIL（没拦）' }
 
 Stop-Process -Id $guard.Id, $bg.Id, $pt.Id -Force -ErrorAction SilentlyContinue

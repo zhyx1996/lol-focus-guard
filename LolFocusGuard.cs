@@ -126,9 +126,25 @@ namespace LolFocusGuard
         public const uint GW_OWNER = 4;
         public const uint GA_ROOT = 2;
         public const int VK_MENU = 0x12;
+        public const int VK_LWIN = 0x5B;
+        public const int VK_RWIN = 0x5C;
         public const int WM_HOTKEY = 0x0312;
         public const uint MOD_ALT = 0x0001;
         public const uint MOD_CONTROL = 0x0002;
+
+        // ---- 系统级"最后一次输入"时间（GetLastInputInfo）：不需要钩子，任何安全软件都拦不住 ----
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LASTINPUTINFO
+        {
+            public uint cbSize;
+            public uint dwTime;
+        }
+
+        [DllImport("user32.dll")]
+        public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+        [DllImport("kernel32.dll")]
+        public static extern uint GetTickCount();
 
         // ---- 低级输入钩子（WH_MOUSE_LL / WH_KEYBOARD_LL）：不注入，回调跑在我们自己线程里 ----
         public const int WH_KEYBOARD_LL = 13;
@@ -245,9 +261,12 @@ namespace LolFocusGuard
         private Native.LowLevelHookProc _mouseProc;
         private Native.LowLevelHookProc _kbdProc;
         private DateTime _lastInputAt = DateTime.MinValue;
-        private bool _lastInputIsKey;
         private string _lastInputWhere = string.Empty; // 鼠标按下时指针压在哪个进程的窗口上
-        private volatile bool _altDown;
+        private int _inputCount;
+        private volatile int _inputAgeMs = int.MaxValue; // 最后一次输入距今（系统级，不信钩子）
+        // Alt / Win 最后一次按下的时间：这两个键才是"切窗口"用的
+        private DateTime _lastModifierAt = DateTime.MinValue;
+        private const int MODIFIER_GRACE_MS = 1500;
 
         public Guard(IEnumerable<string> targets, string logPath, bool verbose, bool noClickAllow,
             string lcuDir)
@@ -366,6 +385,10 @@ namespace LolFocusGuard
                     if (_targetWasMinimized) _lastIconicAt = DateTime.Now;
                 }
 
+                // 每轮都更新"最后一次输入距今多久"和 Alt/Win 状态：
+                // 这是不依赖任何钩子的系统级事实，安全软件（WeGame 的 ACE / SGuard）拦不住。
+                UpdateInputState();
+
                 // 每 4 个 tick 扫一遍目标进程的窗口，记下谁现在是最小化的
                 if ((_scanTick++ % 4) == 0) ScanIconic();
                 if ((_scanTick % 20) == 0) RefreshClientRunning();
@@ -397,7 +420,11 @@ namespace LolFocusGuard
 
                 if (_verbose && (_pollTicks++ % 20) == 0)
                 {
-                    Log("心跳 fg=" + ProcNameOf(fg));
+                    Log(string.Format("心跳 fg={0} 输入={1}次 最后输入={2}ms前({3}) 钩子={4}",
+                        ProcNameOf(fg), _inputCount,
+                        _inputAgeMs,
+                        _lastInputWhere.Length > 0 ? _lastInputWhere : "-",
+                        (_mouseHook != IntPtr.Zero && _kbdHook != IntPtr.Zero) ? "ok" : "缺失"));
                 }
             }
             catch
@@ -453,9 +480,38 @@ namespace LolFocusGuard
                 || (Native.GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0;
         }
 
-        /// <summary>鼠标指针下面那个顶层窗口属于哪个进程。</summary>
-        private static string ProcUnderCursor()
+        /// <summary>
+        /// 每 50ms 更新一次：最后一次输入距今多少毫秒、Alt/Win 是不是按着。
+        /// 用 GetLastInputInfo + GetAsyncKeyState，不依赖低级钩子 ——
+        /// 实测 WeGame 一起来（它带的 ACE/SGuard 安全模块）会把别人的 WH_MOUSE_LL 悄悄掐掉，
+        /// 钩子方案在真正需要它的时候恰好失效，所以判定必须以系统级信息为准。
+        /// </summary>
+        private void UpdateInputState()
         {
+            try
+            {
+                Native.LASTINPUTINFO lii = new Native.LASTINPUTINFO();
+                lii.cbSize = (uint)Marshal.SizeOf(typeof(Native.LASTINPUTINFO));
+                if (Native.GetLastInputInfo(ref lii))
+                {
+                    uint age = Native.GetTickCount() - lii.dwTime;
+                    _inputAgeMs = age > int.MaxValue ? int.MaxValue : (int)age;
+                }
+            }
+            catch
+            {
+                _inputAgeMs = int.MaxValue;
+            }
+
+            if ((Native.GetAsyncKeyState(Native.VK_MENU) & 0x8000) != 0 ||
+                (Native.GetAsyncKeyState(Native.VK_LWIN) & 0x8000) != 0 ||
+                (Native.GetAsyncKeyState(Native.VK_RWIN) & 0x8000) != 0)
+            {
+                _lastModifierAt = DateTime.Now;
+            }
+        }
+        /// <summary>鼠标指针下面那个顶层窗口属于哪个进程。</summary>
+        private static string ProcUnderCursor()        {
             Native.POINT pt;
             if (!Native.GetCursorPos(out pt)) return string.Empty;
             IntPtr under = Native.WindowFromPoint(pt);
@@ -948,8 +1004,8 @@ namespace LolFocusGuard
                     {
                         _lastInputWhere = string.Empty;
                     }
-                    _lastInputIsKey = false;
                     _lastInputAt = DateTime.Now;
+                    _inputCount++; // 钩子回调里不写日志（会拖慢输入），只计数，由心跳线程输出
                 }
             }
             return Native.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
@@ -966,13 +1022,11 @@ namespace LolFocusGuard
                         Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
                     if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
                     {
-                        _lastInputIsKey = true;
                         _lastInputAt = DateTime.Now;
-                        if (info.vkCode == 0x12) _altDown = true; // VK_MENU
-                    }
-                    else if (msg == 0x0101 || msg == 0x0105) // KEYUP / SYSKEYUP
-                    {
-                        if (info.vkCode == 0x12) _altDown = false;
+                        if (info.vkCode == 0x12 || info.vkCode == 0x5B || info.vkCode == 0x5C) // Alt / Win
+                        {
+                            _lastModifierAt = DateTime.Now;
+                        }
                     }
                 }
                 catch
@@ -982,48 +1036,55 @@ namespace LolFocusGuard
             return Native.CallNextHookEx(_kbdHook, nCode, wParam, lParam);
         }
 
-        /// <summary>判断这次前台切换是不是用户自己弄出来的。</summary>
+        /// <summary>
+        /// 判断这次前台切换是不是用户自己弄出来的。
+        /// 依据两条系统级事实：最后输入距今多久、输入那一刻指针在谁身上。
+        /// </summary>
         private bool ShouldAllow(IntPtr hwnd)
         {
             if (_noClickAllow) return false; // 测试模式：忽略一切输入放行
 
-            // Alt 按着（Alt+Tab）→ 放行
-            if (_altDown || (Native.GetAsyncKeyState(Native.VK_MENU) & 0x8000) != 0)
+            // 1) Alt / Win：切窗口专用键（Alt+Tab、Alt+F4、Win+数字、Win+D…）。
+            //    刻意**不**把"任何键盘输入"当放行理由：打游戏时你一直在按 QWER，
+            //    要是按键就算「你在操作」，客户端趁你操作时弹出来就永远拦不住了。
+            if ((DateTime.Now - _lastModifierAt).TotalMilliseconds <= MODIFIER_GRACE_MS)
             {
-                if (_verbose) Log("放行原因: Alt 按着（Alt+Tab）");
+                if (_verbose) Log("放行原因: Alt/Win 切换");
                 return true;
             }
 
-            double idle = (DateTime.Now - _lastInputAt).TotalMilliseconds;
-
-            // 最近有键盘输入 → 是你在切窗口（Alt+Tab、Win+数字、Alt+F4 之类）
-            if (idle <= INPUT_GRACE_MS && _lastInputIsKey)
+            // 2) 系统层面最近完全没有输入 → 它自己弹的
+            int age = _inputAgeMs;
+            if (age > INPUT_GRACE_MS)
             {
-                if (_verbose) Log(string.Format("放行原因: {0}ms 前有键盘输入", (int)idle));
+                if (_verbose) Log(string.Format("不放行: {0}ms 没有输入", age));
+                return false;
+            }
+
+            // 3) 有输入，看输入落在哪儿。
+            //    钩子活着时用"按下那一刻指针在谁身上"（最准）；钩子被安全软件掐掉时
+            //    退回到"此刻指针在谁身上"——点击时指针不会动，两者等价。
+            string where = _lastInputWhere;
+            if ((DateTime.Now - _lastInputAt).TotalMilliseconds > INPUT_GRACE_MS || where.Length == 0)
+            {
+                where = ProcUnderCursor();
+            }
+
+            if (_targets.Contains(where))
+            {
+                if (_verbose) Log("放行原因: 你点了这个窗口（" + where + "）");
+                return true;
+            }
+            if (IsShellProcess(where))
+            {
+                if (_verbose) Log("放行原因: 你点了任务栏/开始菜单（" + where + "）");
                 return true;
             }
 
-            // 最近有鼠标点击，且按下的位置在被切过去的这个窗口自己身上 → 是你点的
-            if (idle <= INPUT_GRACE_MS && !_lastInputIsKey && _lastInputWhere.Length > 0)
-            {
-                if (_targets.Contains(_lastInputWhere))
-                {
-                    if (_verbose) Log("放行原因: 你点了这个窗口（" + _lastInputWhere + "）");
-                    return true;
-                }
-                if (IsShellProcess(_lastInputWhere))
-                {
-                    if (_verbose) Log("放行原因: 你点了任务栏/开始菜单（" + _lastInputWhere + "）");
-                    return true;
-                }
-                // 点在别的程序上（你正在打字/点游戏），这个窗口却跑到前台来了 = 它自己弹的
-            }
-
-            // 注意：这里刻意**不**用"指针此刻压在目标窗口上"放行。
-            // 鼠标可能只是随手停在那里（比如刚才点过它），窗口自己弹出来时会被误放行。
+            // 输入发生在别的程序上（你在打游戏/打字），这个窗口却跑到前台来了 = 自弹
+            if (_verbose) Log("不放行: 刚才的输入落在别的程序上（" + (where.Length > 0 ? where : "?") + "）");
             return false;
         }
-
         /// <summary>最近这次"鼠标按下"落在哪个进程的窗口上；没按下过返回空。</summary>
         private string ClickTargetProc()
         {
