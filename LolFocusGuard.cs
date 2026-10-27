@@ -235,9 +235,6 @@ namespace LolFocusGuard
         private volatile bool _clientRunning;
         private DateTime _clientCheckAt = DateTime.MinValue;
         private DateTime _lastWegameAllowLogAt = DateTime.MinValue;
-        // 启动阶段放行：这些进程刚起来时出现的新窗口（登录页/启动页）不拦
-        private readonly List<string> _freshProcs = new List<string>();
-        private int _freshSeconds = 300;
         // 已经见过的目标窗口（只放过"第一次出现"的窗口）
         private readonly HashSet<IntPtr> _knownWindows = new HashSet<IntPtr>();
 
@@ -253,7 +250,7 @@ namespace LolFocusGuard
         private volatile bool _altDown;
 
         public Guard(IEnumerable<string> targets, string logPath, bool verbose, bool noClickAllow,
-            IEnumerable<string> freshProcs, int freshSeconds, string lcuDir)
+            string lcuDir)
         {
             _lcuDir = lcuDir;
             _targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -261,14 +258,6 @@ namespace LolFocusGuard
             _logPath = logPath;
             _verbose = verbose;
             _noClickAllow = noClickAllow;
-            if (freshProcs != null)
-            {
-                foreach (string p in freshProcs)
-                {
-                    if (!string.IsNullOrWhiteSpace(p)) _freshProcs.Add(p.Trim());
-                }
-            }
-            _freshSeconds = freshSeconds;
 
             _callback = new Native.WinEventDelegate(OnForegroundChanged);
             _hook = Native.SetWinEventHook(
@@ -314,11 +303,6 @@ namespace LolFocusGuard
             RefreshTarget(false);
 
             Log("守卫启动，监控进程: " + string.Join(", ", _targets));
-            if (_freshProcs.Count > 0)
-            {
-                Log(string.Format("启动阶段放行: {0}（进程启动后 {1} 秒内的新窗口不拦，用于放行登录页）",
-                    string.Join(", ", _freshProcs), _freshSeconds));
-            }
             if (_hook == IntPtr.Zero) Log("警告：SetWinEventHook 失败，无法监听前台切换");
             if (_mouseHook == IntPtr.Zero || _kbdHook == IntPtr.Zero)
             {
@@ -941,41 +925,6 @@ namespace LolFocusGuard
             return true;
         }
 
-        /// <summary>
-        /// 是不是"客户端刚启动时第一次冒出来的那个窗口"。
-        /// 用来放行登录页：LeagueClientUx 启动后的几分钟内，第一次出现的窗口不拦；
-        /// 之后同一个窗口再抢前台（匹配成功那类）照拦。
-        /// </summary>
-        private bool IsStartupWindow(IntPtr hwnd)
-        {
-            lock (_sync)
-            {
-                if (_knownWindows.Contains(hwnd)) return false;
-                _knownWindows.Add(hwnd); // 见过了，之后就按正常规则处理
-            }
-
-            if (_freshSeconds <= 0 || _freshProcs.Count == 0) return false;
-
-            string proc = ProcNameOf(hwnd);
-            bool listed = false;
-            foreach (string p in _freshProcs)
-            {
-                if (string.Equals(p, proc, StringComparison.OrdinalIgnoreCase)) { listed = true; break; }
-            }
-            if (!listed) return false;
-
-            try
-            {
-                using (Process pr = Process.GetProcessById(ProcIdOf(hwnd)))
-                {
-                    return (DateTime.Now - pr.StartTime).TotalSeconds <= _freshSeconds;
-                }
-            }
-            catch
-            {
-                return false;
-            }
-        }
 
         // ---------- 低级输入钩子 ----------
         private IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
@@ -1504,11 +1453,6 @@ namespace LolFocusGuard
                 bool verbose = false;
                 bool noClickAllow = false;
                 bool targetsFromArg = false;
-                // 启动阶段放行：客户端刚启动时第一次出现的窗口（登录页）不拦
-                List<string> freshProcs = new List<string>();
-                freshProcs.Add("LeagueClientUx");
-                freshProcs.Add("RiotClientServices");
-                int freshSeconds = 300;
                 string lcuDir = null;
 
                 foreach (string arg in args)
@@ -1532,23 +1476,9 @@ namespace LolFocusGuard
                     {
                         noClickAllow = true; // 仅用于自动化测试：忽略"用户点击"放行规则
                     }
-                    else if (arg.StartsWith("--fresh=", StringComparison.OrdinalIgnoreCase))
-                    {
-                        int v;
-                        if (int.TryParse(arg.Substring("--fresh=".Length), out v)) freshSeconds = v;
-                    }
                     else if (arg.StartsWith("--lcu-dir=", StringComparison.OrdinalIgnoreCase))
                     {
                         lcuDir = arg.Substring("--lcu-dir=".Length).Trim('"');
-                    }
-                    else if (arg.StartsWith("--fresh-procs=", StringComparison.OrdinalIgnoreCase))
-                    {
-                        freshProcs.Clear();
-                        foreach (string part in arg.Substring("--fresh-procs=".Length).Split(','))
-                        {
-                            string trimmed = part.Trim();
-                            if (trimmed.Length > 0) freshProcs.Add(trimmed);
-                        }
                     }
                 }
 
@@ -1615,7 +1545,7 @@ namespace LolFocusGuard
                 }
 
                 using (Guard guard = new Guard(targets, Path.Combine(logDir, "guard.log"), verbose, noClickAllow,
-                    freshProcs, freshSeconds, lcuDir))
+                    lcuDir))
                 {
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
