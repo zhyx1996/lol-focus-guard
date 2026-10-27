@@ -59,7 +59,13 @@ $iconicNow = if ($hwnd -ne [IntPtr]::Zero) { [G]::IsIconic($hwnd) } else { $fals
 "假客户端弹了 $popCount 次，守卫拦了 $blockCount 次（其中识别为'从最小化弹出' $minimizedCount 次），当前前台=$fgNow 假窗口最小化=$iconicNow"
 
 $pass = $true
-if ($blockCount -lt $popCount - 1) { "FAIL: 有 $($popCount - $blockCount) 次弹出没被拦"; $pass = $false } else { "ok  : $blockCount 次弹出全被拦" }
+$suppressed = ([regex]::Matches($guardText, '放弃拦截 60 秒')).Count
+# 防拉锯阀：同一窗口 10 秒内被拦超过 5 次就放弃 60 秒，所以期望拦的是前 6 次
+$expectedBlocks = [Math]::Min($popCount, 5)
+if ($blockCount -lt $expectedBlocks) { "FAIL: 只拦了 $blockCount 次（期望至少 $expectedBlocks 次）"; $pass = $false }
+else { "ok  : 拦了 $blockCount 次（假客户端一共弹了 $popCount 次）" }
+if ($popCount -gt 6 -and $suppressed -lt 1) { 'FAIL: 弹了这么多次却没触发防拉锯阀（会跟它一直拉锯）'; $pass = $false }
+elseif ($suppressed -ge 1) { "ok  : 触发防拉锯阀 $suppressed 次（拦 6 次后主动放弃 60 秒）" }
 if ($minimizedCount -lt 1) { 'FAIL: 从没识别出"从最小化弹出"' ; $pass = $false } else { "ok  : 识别到从最小化弹出的情况 $minimizedCount 次" }
 # 注：FakeClient 每 1.2 秒会自己再弹一次，所以"结束时前台是谁"没有意义——它就是个死缠烂打的假客户端。
 # 真正要看的是：每次弹出都被拦（上面那条）+ 拦的时候会不会最小化回去（最小化那条）。

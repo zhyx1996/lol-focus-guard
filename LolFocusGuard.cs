@@ -264,6 +264,11 @@ namespace LolFocusGuard
         private string _lastInputWhere = string.Empty; // 鼠标按下时指针压在哪个进程的窗口上
         private int _inputCount;
         private volatile int _inputAgeMs = int.MaxValue; // 最后一次输入距今（系统级，不信钩子）
+        // 防拉锯：同一窗口 10 秒内被拦太多次就放弃拦截 60 秒
+        private IntPtr _streakHwnd = IntPtr.Zero;
+        private int _streakCount;
+        private DateTime _streakAt = DateTime.MinValue;
+        private readonly Dictionary<IntPtr, DateTime> _suppressedUntil = new Dictionary<IntPtr, DateTime>();
         // Alt / Win 最后一次按下的时间：这两个键才是"切窗口"用的
         private DateTime _lastModifierAt = DateTime.MinValue;
         private const int MODIFIER_GRACE_MS = 1500;
@@ -550,7 +555,7 @@ namespace LolFocusGuard
             _clientCheckAt = DateTime.Now;
 
             bool running = false;
-            string[] names = { "LeagueClientUx", "LeagueClient" };
+            string[] names = { "LeagueClientUx", "LeagueClient", "RiotClientServices" };
             foreach (string n in names)
             {
                 try
@@ -956,6 +961,12 @@ namespace LolFocusGuard
                     return;
                 }
 
+                if (IsSuppressed(hwnd))
+                {
+                    if (_verbose) Log("放行原因: 正在放弃拦截期（刚才拦太多次）");
+                    return;
+                }
+
                 if (ShouldAllow(hwnd)) return;
 
                 Block(hwnd);
@@ -1037,6 +1048,21 @@ namespace LolFocusGuard
             return Native.CallNextHookEx(_kbdHook, nCode, wParam, lParam);
         }
 
+        /// <summary>这个窗口是不是正在「放弃拦截」期里（见 Block 里的防拉锯逻辑）。</summary>
+        private bool IsSuppressed(IntPtr hwnd)
+        {
+            lock (_sync)
+            {
+                DateTime until;
+                if (_suppressedUntil.TryGetValue(hwnd, out until))
+                {
+                    if (DateTime.Now < until) return true;
+                    _suppressedUntil.Remove(hwnd);
+                }
+            }
+            return false;
+        }
+
         /// <summary>
         /// 判断这次前台切换是不是用户自己弄出来的。
         /// 依据两条系统级事实：最后输入距今多久、输入那一刻指针在谁身上。
@@ -1054,7 +1080,17 @@ namespace LolFocusGuard
                 return true;
             }
 
-            // 2) 系统层面最近完全没有输入 → 它自己弹的
+            // 2) 上一个前台窗口已经没了（比如刚打完这一局、游戏窗口关闭退出）：
+            //    这时候前台自然落到客户端身上是正常现象，拦了反而「刚打完就被最小化」。
+            //    注意必须确认那个窗口真的不存在了——游戏还在、客户端自己跳出来，照拦。
+            IntPtr prev = _lastForeground;
+            if (prev != IntPtr.Zero && prev != hwnd && !Native.IsWindow(prev))
+            {
+                if (_verbose) Log("放行原因: 上一个前台窗口已经关闭，前台自动接管");
+                return true;
+            }
+
+            // 3) 系统层面最近完全没有输入 → 它自己弹的
             int age = _inputAgeMs;
             if (age > INPUT_GRACE_MS)
             {
@@ -1062,7 +1098,7 @@ namespace LolFocusGuard
                 return false;
             }
 
-            // 3) 有输入，看输入落在哪儿。
+            // 4) 有输入，看输入落在哪儿。
             //    钩子活着时用"按下那一刻指针在谁身上"（最准）；钩子被安全软件掐掉时
             //    退回到"此刻指针在谁身上"——点击时指针不会动，两者等价。
             string where = _lastInputWhere;
@@ -1104,6 +1140,28 @@ namespace LolFocusGuard
             if ((now - _lastBlockRequestAt).TotalMilliseconds < 80) return; // 防重入抖动
             _lastBlockRequestAt = now;
             _lastBlockAt = now;
+
+            // 同一个窗口在 10 秒内被拦太多次（比如它是个模态框、一直往回抢）：
+            // 再拦下去就是跟它来回拉锯，机器会变得很难用。这时放弃拦截 60 秒并记一笔，
+            // 宁可让它弹一次，也不能把正常使用卡死。
+            if (hwnd == _streakHwnd && (now - _streakAt).TotalSeconds <= 10)
+            {
+                _streakCount++;
+            }
+            else
+            {
+                _streakHwnd = hwnd;
+                _streakCount = 1;
+                _streakAt = now;
+            }
+            if (_streakCount > 5)
+            {
+                lock (_sync) { _suppressedUntil[hwnd] = now.AddSeconds(60); }
+                _streakCount = 0;
+                Log(string.Format("放弃拦截 60 秒：{0}（pid={1}，标题=\"{2}\"）10 秒内抢了 6 次前台，再拦就是跟它拉锯了",
+                    ProcNameOfCached(hwnd), ProcIdOf(hwnd), TitleOf(hwnd)));
+                return;
+            }
 
             int number = ++_blockCount;
 

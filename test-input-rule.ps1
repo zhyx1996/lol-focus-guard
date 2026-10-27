@@ -14,6 +14,8 @@ public class T4 {
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
   [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint c);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
@@ -72,27 +74,44 @@ if ($bgH -eq [IntPtr]::Zero -or $ptH -eq [IntPtr]::Zero) { throw '测试窗口�
 $guard = Start-Process (Join-Path $PSScriptRoot 'LolFocusGuard.exe') -ArgumentList '--targets=PopTarget','--verbose' -PassThru
 Start-Sleep -Seconds 2
 
-# ---------- A) 用户点击 PopTarget ----------
-# 先把焦点给对照组（也是真人式点击），再点被监控窗口 → 必须放行
-[T4]::ClickWindow($bgH)
-Start-Sleep -Milliseconds 800
-"点击前前台 = $([T4]::FgProc())"
-$before = (Get-Content $guardLog -Raw).Length
-[T4]::ClickWindow($ptH)
-Start-Sleep -Seconds 2
-$now = Get-Content $guardLog -Raw
-$partA = $now.Substring([Math]::Min($before, $now.Length))
-"=== A) 点击 PopTarget 之后的日志 ==="
-($partA -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6)
-
-$lines = @($partA -split "`r?`n" | Where-Object { $_.Trim() })
-$idx = -1
-for ($i = 0; $i -lt $lines.Count; $i++) {
-    if ($lines[$i] -match '前台变化 → PopTarget' -and $lines[$i] -match '有输入=True') { $idx = $i; break }
+# 输入注入可能被安全软件（WeGame 的 ACE）拦掉：SetCursorPos 返回 False 且指针不动。
+# 这时 A 阶段没法测，直接说明并跳过，不要误报 FAIL。
+$injectOk = $true
+[T4]::SetCursorPos(400, 400) | Out-Null
+Start-Sleep -Milliseconds 150
+$pt430 = New-Object T4+POINT
+[void][T4]::GetCursorPos([ref]$pt430)
+if ($pt430.X -ne 400 -or $pt430.Y -ne 400) {
+    $injectOk = $false
+    "注意：这台机器上输入注入被拦了（指针停在 $($pt430.X),$($pt430.Y)，SetCursorPos 无效），A 阶段跳过。"
+    "      WeGame 的 ACE 会拦 SendInput/SetCursorPos，所以这里只能测 B 阶段（无输入自弹必须被拦）。"
 }
-if ($idx -lt 0) { 'A 结果: 未知（点击没产生前台切换，看上面日志）' }
-elseif ($idx + 1 -lt $lines.Count -and $lines[$idx + 1] -match '拦截 #') { 'A 结果: FAIL（用户点击被拦了）' }
-else { 'A 结果: PASS（点击被识别为用户操作，未拦）' }
+
+if ($injectOk) {
+    # ---------- A) 用户点击 PopTarget ----------
+    # 先把焦点给对照组（也是真人式点击），再点被监控窗口 → 必须放行
+    [T4]::ClickWindow($bgH)
+    Start-Sleep -Milliseconds 800
+    "点击前前台 = $([T4]::FgProc())"
+    $before = (Get-Content $guardLog -Raw).Length
+    [T4]::ClickWindow($ptH)
+    Start-Sleep -Seconds 2
+    $now = Get-Content $guardLog -Raw
+    $partA = $now.Substring([Math]::Min($before, $now.Length))
+    "=== A) 点击 PopTarget 之后的日志 ==="
+    ($partA -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6)
+
+    $lines = @($partA -split "`r?`n" | Where-Object { $_.Trim() })
+    $idx = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '前台变化 → PopTarget' -and $lines[$i] -match '有输入=True') { $idx = $i; break }
+    }
+    if ($idx -lt 0) { 'A 结果: 未知（点击没产生前台切换，看上面日志）' }
+    elseif ($idx + 1 -lt $lines.Count -and $lines[$idx + 1] -match '拦截 #') { 'A 结果: FAIL（用户点击被拦了）' }
+    else { 'A 结果: PASS（点击被识别为用户操作，未拦）' }
+
+} else { 'A 结果: 跳过（输入注入被安全软件拦了）' }
+
 # ---------- B) PopTarget 自己抢前台（先最小化再恢复，保证有事件） ----------
 $before = (Get-Content $guardLog -Raw).Length
 Set-Content -Path $flag -Value 'cycle'
