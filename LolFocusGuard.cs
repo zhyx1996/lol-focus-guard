@@ -329,7 +329,8 @@ namespace LolFocusGuard
             }
             else
             {
-                Log(string.Format("输入钩子已安装（{0}ms 内的输入算你自己操作）", INPUT_GRACE_MS));
+                Log(string.Format("判定依据: GetLastInputInfo（{0}ms 内有输入算你自己操作）+ 指针位置；低级钩子{1}",
+                    INPUT_GRACE_MS, (_mouseHook != IntPtr.Zero && _kbdHook != IntPtr.Zero) ? "已安装（可能被 WeGame 的 ACE 掐掉，不影响判定）" : "没装上（不影响判定）"));
             }
         }
 
