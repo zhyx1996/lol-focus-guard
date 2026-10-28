@@ -937,11 +937,46 @@ namespace LolFocusGuard
 
                 if (_paused) return;
 
+                // 把"事实"收集齐，交给纯函数判定 —— 规则表在 Rules.cs，可以穷举测试
+                // （LogicTest.cs 不用开客户端、不用注入输入就能把每条规则跑一遍）。
+                DecisionFacts facts = new DecisionFacts();
+                facts.TestModeOnly = _noClickAllow;
                 // 国服的登录窗口是 WeGame 弹的（不是客户端）：客户端还没起来的时候，
                 // WeGame 的窗口一律放行，不然用户连登录都点不了；
                 // 客户端已经起来之后再冒出来的（"游戏进程已启动"那张卡片）才拦。
-                if (IsWeGameProcess(proc) && !_clientRunning)
+                facts.WeGameLoginPhase = IsWeGameProcess(proc) && !_clientRunning;
+                // 注意：这个方法有副作用（记住"这个窗口见过了"），必须调用
+                facts.FirstClientWindow = IsFirstClientWindow(hwnd, proc);
+                facts.Suppressed = IsSuppressed(hwnd);
+                facts.ModifierIdleMs = (DateTime.Now - _lastModifierAt).TotalMilliseconds;
+                facts.InputAgeMs = _inputAgeMs;
+                facts.PrevWindowGone = _lastForeground != IntPtr.Zero && _lastForeground != hwnd &&
+                                       !Native.IsWindow(_lastForeground);
+
+                // 输入落在谁身上：钩子活着时用"按下那一刻指针在哪"（最准）；
+                // 钩子被安全软件掐掉时退回到"此刻指针在哪"——点击时指针不会动，两者等价。
+                string where = _lastInputWhere;
+                if ((DateTime.Now - _lastInputAt).TotalMilliseconds > INPUT_GRACE_MS || where.Length == 0)
                 {
+                    where = ProcUnderCursor();
+                }
+                facts.InputOnTarget = _targets.Contains(where);
+                facts.InputOnShell = IsShellProcess(where);
+
+                Decision decision = FocusRules.Decide(facts);
+                LogDecision(decision, hwnd, where);
+                if (decision.Allow) return;
+
+                Block(hwnd);
+            }
+        }
+
+        /// <summary>把判定结果写进日志（放行原因只在 verbose 下写，WeGame 登录放行在非 verbose 下也留证据）。</summary>
+        private void LogDecision(Decision d, IntPtr hwnd, string where)
+        {
+            switch (d.Code)
+            {
+                case DecisionCode.AllowWeGameLogin:
                     if (_verbose) Log("放行原因: WeGame 登录阶段（客户端还没起来）");
                     else if ((DateTime.Now - _lastWegameAllowLogAt).TotalSeconds > 3)
                     {
@@ -950,26 +985,33 @@ namespace LolFocusGuard
                         Log(string.Format("放行 WeGame 窗口（登录阶段，客户端还没起来）：class={0}，标题=\"{1}\"",
                             ClassNameOf(hwnd), TitleOf(hwnd)));
                     }
-                    return;
-                }
-
-                // 客户端第一次冒出窗口（登录页 / 启动页 / 安全检测）：放行。
-                // 之后同一个窗口再跳前台（匹配成功那类）就按输入判据处理了。
-                if (IsFirstClientWindow(hwnd, proc))
-                {
+                    break;
+                case DecisionCode.AllowFirstClientWindow:
                     if (_verbose) Log("放行原因: 客户端窗口第一次出现（登录页/启动页）");
-                    return;
-                }
-
-                if (IsSuppressed(hwnd))
-                {
+                    break;
+                case DecisionCode.AllowSuppressed:
                     if (_verbose) Log("放行原因: 正在放弃拦截期（刚才拦太多次）");
-                    return;
-                }
-
-                if (ShouldAllow(hwnd)) return;
-
-                Block(hwnd);
+                    break;
+                case DecisionCode.AllowModifier:
+                    if (_verbose) Log("放行原因: Alt/Win 切换");
+                    break;
+                case DecisionCode.AllowPrevWindowGone:
+                    if (_verbose) Log("放行原因: 上一个前台窗口已经关闭，前台自动接管");
+                    break;
+                case DecisionCode.AllowClickedTarget:
+                    if (_verbose) Log("放行原因: 你点了这个窗口（" + where + "）");
+                    break;
+                case DecisionCode.AllowClickedShell:
+                    if (_verbose) Log("放行原因: 你点了任务栏/开始菜单（" + where + "）");
+                    break;
+                case DecisionCode.BlockNoInput:
+                    if (_verbose) Log(string.Format("不放行: {0}ms 没有输入", _inputAgeMs));
+                    break;
+                case DecisionCode.BlockInputElsewhere:
+                    if (_verbose) Log("不放行: 刚才的输入落在别的程序上（" + (where.Length > 0 ? where : "?") + "）");
+                    break;
+                case DecisionCode.BlockTestMode:
+                    break;
             }
         }
 
@@ -1060,66 +1102,6 @@ namespace LolFocusGuard
                     _suppressedUntil.Remove(hwnd);
                 }
             }
-            return false;
-        }
-
-        /// <summary>
-        /// 判断这次前台切换是不是用户自己弄出来的。
-        /// 依据两条系统级事实：最后输入距今多久、输入那一刻指针在谁身上。
-        /// </summary>
-        private bool ShouldAllow(IntPtr hwnd)
-        {
-            if (_noClickAllow) return false; // 测试模式：忽略一切输入放行
-
-            // 1) Alt / Win：切窗口专用键（Alt+Tab、Alt+F4、Win+数字、Win+D…）。
-            //    刻意**不**把"任何键盘输入"当放行理由：打游戏时你一直在按 QWER，
-            //    要是按键就算「你在操作」，客户端趁你操作时弹出来就永远拦不住了。
-            if ((DateTime.Now - _lastModifierAt).TotalMilliseconds <= MODIFIER_GRACE_MS)
-            {
-                if (_verbose) Log("放行原因: Alt/Win 切换");
-                return true;
-            }
-
-            // 2) 上一个前台窗口已经没了（比如刚打完这一局、游戏窗口关闭退出）：
-            //    这时候前台自然落到客户端身上是正常现象，拦了反而「刚打完就被最小化」。
-            //    注意必须确认那个窗口真的不存在了——游戏还在、客户端自己跳出来，照拦。
-            IntPtr prev = _lastForeground;
-            if (prev != IntPtr.Zero && prev != hwnd && !Native.IsWindow(prev))
-            {
-                if (_verbose) Log("放行原因: 上一个前台窗口已经关闭，前台自动接管");
-                return true;
-            }
-
-            // 3) 系统层面最近完全没有输入 → 它自己弹的
-            int age = _inputAgeMs;
-            if (age > INPUT_GRACE_MS)
-            {
-                if (_verbose) Log(string.Format("不放行: {0}ms 没有输入", age));
-                return false;
-            }
-
-            // 4) 有输入，看输入落在哪儿。
-            //    钩子活着时用"按下那一刻指针在谁身上"（最准）；钩子被安全软件掐掉时
-            //    退回到"此刻指针在谁身上"——点击时指针不会动，两者等价。
-            string where = _lastInputWhere;
-            if ((DateTime.Now - _lastInputAt).TotalMilliseconds > INPUT_GRACE_MS || where.Length == 0)
-            {
-                where = ProcUnderCursor();
-            }
-
-            if (_targets.Contains(where))
-            {
-                if (_verbose) Log("放行原因: 你点了这个窗口（" + where + "）");
-                return true;
-            }
-            if (IsShellProcess(where))
-            {
-                if (_verbose) Log("放行原因: 你点了任务栏/开始菜单（" + where + "）");
-                return true;
-            }
-
-            // 输入发生在别的程序上（你在打游戏/打字），这个窗口却跑到前台来了 = 自弹
-            if (_verbose) Log("不放行: 刚才的输入落在别的程序上（" + (where.Length > 0 ? where : "?") + "）");
             return false;
         }
         /// <summary>最近这次"鼠标按下"落在哪个进程的窗口上；没按下过返回空。</summary>

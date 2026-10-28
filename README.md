@@ -187,10 +187,25 @@ D:\WeGameApps\英雄联盟\LeagueClient
 
 ```powershell
 pwsh ./build.ps1
+.\LogicTest.exe                  # 规则表穷举测试（17 条，不开窗口、不注入输入，纯逻辑）
 pwsh ./test-fake-client.ps1      # 假客户端反复自己弹前台 → 必须"弹一次拦一次"
 pwsh ./test-input-rule.ps1       # 核心判据：模拟点击目标窗口=放行；无输入自弹=拦截
 pwsh ./test-rules.ps1            # 真实判定链：客户端窗口首次出现放行→后续拦截、WeGame 卡片拦截/登录放行
 pwsh ./test-live.ps1             # 需要真实客户端在运行（用真窗口再验一遍）
+```
+
+判定规则本身在 `Rules.cs` 里是一个**纯函数**（`FocusRules.Decide(DecisionFacts)`）：
+不碰窗口、不读全局状态，只吃"事实"、吐"放行/拦截 + 原因"。`LogicTest.cs` 直接构造事实喂给它，
+把每条规则和边界（500ms / 1500ms 宽限、优先级顺序）都验一遍。改规则前后跑一次，
+就知道有没有把「你手动切窗口」改成「拦」，不用真开客户端去试：
+
+```
+> .\LogicTest.exe
+  ok   没有任何输入，客户端自己跳前台 → 拦截
+  ok   有输入但落在别的程序上（你在打游戏）→ 拦截
+  ok   有输入且点在客户端窗口上 → 放行
+  ...
+结果: PASS，通过 17，失败 0
 ```
 
 `test-input-rule.ps1` 每次现场编译一个 200 行的测试小程序（`PopTarget.cs`），
