@@ -260,6 +260,8 @@ namespace LolFocusGuard
         // ---- 低级输入钩子：区分"你自己切过去的"和"进程强制抢前台" ----
         // 判定用的两个时间窗口只有一份定义（在 Rules.cs），这里只是别名，避免两边改漏一边
         private const int CLICK_GRACE_MS = FocusRules.ClickGraceMs; // 按键按下后多久内算"这次切换是你点的"
+        // 任务栏/开始菜单点击的宽限：从按下到窗口真正激活可能要几百毫秒
+        private const int SHELL_CLICK_GRACE_MS = 2500;
         private IntPtr _mouseHook = IntPtr.Zero;
         private IntPtr _kbdHook = IntPtr.Zero;
         private Native.LowLevelHookProc _mouseProc;
@@ -273,6 +275,10 @@ namespace LolFocusGuard
         private string _cursorProcPrev = "";
         private DateTime _lastAllowAt = DateTime.MinValue;
         private IntPtr _lastAllowHwnd = IntPtr.Zero;
+        private volatile string _lastAllowProc = "";
+        // 待打回的目标窗口：只有「拦过一次、它又赖在前台」才重试；用户一接管就作废
+        private IntPtr _pendingBlockHwnd = IntPtr.Zero;
+        private DateTime _pendingBlockAt = DateTime.MinValue;
         private IntPtr _streakHwnd = IntPtr.Zero;
         private int _streakCount;
         private DateTime _streakAt = DateTime.MinValue;
@@ -284,7 +290,7 @@ namespace LolFocusGuard
         private bool _mouseWasDown;
         private int _clickCount;
         private const int MODIFIER_GRACE_MS = FocusRules.ModifierGraceMs;
-        private const int JUST_ALLOWED_MS = 800; // 刚放行过的窗口，这段时间内不再压回去
+        private const int JUST_ALLOWED_MS = 3000; // 刚放行过的窗口/程序，这段时间内不再压回去（你还在用它）
 
         public Guard(IEnumerable<string> targets, string logPath, bool verbose, bool noClickAllow,
             string lcuDir)
@@ -440,12 +446,17 @@ namespace LolFocusGuard
                 {
                     ProcessForeground(fg, false);
                 }
-                else if (fg != IntPtr.Zero && fg == _targetHwnd && _lastBlockAt != DateTime.MinValue &&
-                         (DateTime.Now - _lastBlockAt).TotalMilliseconds > 1200)
+                else if (fg != IntPtr.Zero && fg == _pendingBlockHwnd &&
+                         (DateTime.Now - _pendingBlockAt).TotalMilliseconds > 1200)
                 {
-                    // 目标窗口一直赖在前台没被打回去：每隔 1.2 秒再试一次。
-                    // 但你 3 秒内刚放行过它（说明是你自己点开的）就别再压了。
-                    if ((DateTime.Now - _lastAllowAt).TotalMilliseconds > 3000)
+                    // 打回过一次、它却还赖在前台（上次没压下去）：再试一次。
+                    // 但只要你在此期间自己放行过它（点任务栏/点窗口/Alt+Tab），这个待办立刻作废 ——
+                    // 否则就是「我点了任务栏把它叫出来，1.2 秒后它又被最小化」，得点好几遍才能切出来。
+                    if (_lastAllowAt > _pendingBlockAt)
+                    {
+                        _pendingBlockHwnd = IntPtr.Zero;
+                    }
+                    else
                     {
                         _lastFgHwnd = IntPtr.Zero;
                         ProcessForeground(fg, true);
@@ -1016,8 +1027,11 @@ namespace LolFocusGuard
                 // 注意：这个方法有副作用（记住"这个窗口见过了"），必须调用
                 facts.FirstClientWindow = IsFirstClientWindow(hwnd, proc);
                 facts.Suppressed = IsSuppressed(hwnd);
-                // 刚刚(800ms 内)才放行过这个窗口 → 别再压回去（"我刚点开你就给我最小化"）
-                facts.RecentlyAllowed = hwnd == _lastAllowHwnd &&
+                // 刚刚放行过这个窗口（或者同一个程序的窗口）→ 别再压回去
+                // （"我刚点开你就给我最小化"）。3 秒内都算你还在用它。
+                facts.RecentlyAllowed = (hwnd == _lastAllowHwnd ||
+                                         (_lastAllowProc.Length > 0 &&
+                                          string.Equals(proc, _lastAllowProc, StringComparison.OrdinalIgnoreCase))) &&
                                         (DateTime.Now - _lastAllowAt).TotalMilliseconds < JUST_ALLOWED_MS;
                 facts.ModifierIdleMs = (DateTime.Now - _lastModifierAt).TotalMilliseconds;
                 // 「你手动切窗口」的硬证据：鼠标物理按键真的按下了（ClickWatchLoop 每 15ms 采一次），
@@ -1026,14 +1040,31 @@ namespace LolFocusGuard
                 // 重试轮里窗口已经在最前面、指针必然压着它 —— 那一轮不能把"指针在它上面"算成你点的
                 string where = _lastClickWhere;
                 facts.ClickOnTarget = !retry && _targets.Contains(where);
-                facts.ClickOnShell = !retry && IsShellProcess(where);
+                // 任务栏/开始菜单的点击：从按下到窗口真正被激活往往要几百毫秒（客户端从最小化恢复
+                // 尤其慢），所以任务栏这一路单独给 2.5 秒宽限，否则「点任务栏把它叫出来」会被判成自弹。
+                facts.ClickOnShell = !retry && IsShellProcess(where) &&
+                                     facts.ClickAgeMs <= SHELL_CLICK_GRACE_MS;
+                if (facts.ClickOnShell) facts.ClickAgeMs = Math.Min(facts.ClickAgeMs, FocusRules.ClickGraceMs);
                 facts.PrevWindowGone = _lastForeground != IntPtr.Zero && _lastForeground != hwnd &&
                                        !Native.IsWindow(_lastForeground);
 
                 Decision decision = FocusRules.Decide(facts);
                 LogDecision(decision, hwnd, where);
-                if (decision.Allow) return;
+                if (decision.Allow)
+                {
+                    // 记下"刚刚放行过这个窗口" —— 这是「我刚点开你就给我最小化」的唯一防线。
+                    // （之前这里漏了赋值，导致 RecentlyAllowed 永远是 false、下面的重试也永远放行不了，
+                    //   真机上就是"点了任务栏把客户端叫出来，1.2 秒后又被压回去"，得点好几遍。）
+                    _lastAllowAt = DateTime.Now;
+                    _lastAllowHwnd = hwnd;
+                    _lastAllowProc = proc;
+                    // 你接管了这个窗口：任何"打回它"的待办立刻作废
+                    _pendingBlockHwnd = IntPtr.Zero;
+                    return;
+                }
 
+                _pendingBlockHwnd = hwnd;
+                _pendingBlockAt = DateTime.Now;
                 Block(hwnd);
             }
         }
@@ -1225,8 +1256,11 @@ namespace LolFocusGuard
 
             // 同一窗口在 2 秒内又来抢前台 → 说明只把焦点还回去不够（它自己还会再弹），
             // 直接最小化掉，别跟它来回拉锯。
+            // 注意顺序：必须先用旧值算「间隔」，再更新 _lastBlockAt ——
+            // 之前是先更新再算，导致这个判断几乎永远成立（同一个窗口隔多久都会被当成"连续弹"）。
+            DateTime previousBlockAt = _lastBlockAt;
             bool escalating = (hwnd == _lastBlockedHwnd) &&
-                              (now - _lastBlockAt).TotalMilliseconds < 2000;
+                              (now - previousBlockAt).TotalMilliseconds < 2000;
             _lastBlockedHwnd = hwnd;
 
             bool wasMinimized = escalating || IsRecentlyIconic(hwnd, 5) ||
