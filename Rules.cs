@@ -111,4 +111,59 @@ namespace LolFocusGuard
             return new Decision(false, DecisionCode.BlockInputElsewhere);
         }
     }
+
+    /// <summary>
+    /// 进程 / 窗口的分类判据。全部是纯字符串比较 —— 不碰窗口、不读全局状态，
+    /// 所以能像规则表一样穷举测试（LogicTest.cs 里有一节专门验它）。
+    ///
+    /// 为什么要单独拎出来：真机上 WeGame 的界面并不是 wegame.exe 画的，它跑在
+    /// browser.exe（class CefTopWindow、标题 "WeGame"）和 pallas.exe 里；
+    /// 而 browser.exe 这名字又被 QQ 用着（class QBCoreAx）。按进程名一刀切会两头出错：
+    /// 该拦的 WeGame 窗口漏掉，不该拦的 QQ 窗口被当成 WeGame。
+    /// </summary>
+    internal static class ProcClass
+    {
+        public static bool IsShell(string proc)
+        {
+            return Eq(proc, "explorer")
+                || Eq(proc, "StartMenuExperienceHost")
+                || Eq(proc, "ShellExperienceHost")
+                || Eq(proc, "SearchHost");
+        }
+
+        public static bool IsClient(string proc)
+        {
+            return Eq(proc, "LeagueClientUx")
+                || Eq(proc, "LeagueClient")
+                || Eq(proc, "RiotClientServices");
+        }
+
+        public static bool IsWeGame(string proc)
+        {
+            return Eq(proc, "wegame") || Eq(proc, "wegame_env");
+        }
+
+        /// <summary>
+        /// 这个窗口算不算 WeGame 的。三种证据，命中任意一条即可：
+        ///   1) 进程就是 wegame.exe / wegame_env.exe；
+        ///   2) 进程是 pallas.exe（WeGame 的内嵌网页宿主，窗口类 TWINCONTROL）；
+        ///   3) 进程是 browser.exe 且窗口标题含 "WeGame"（CEF 那条腿）；
+        ///      或者类名是 CefTopWindow 且标题就是 "WeGame…"（标题足够独特，认标题也够）。
+        /// QQ 那个 browser.exe（class QBCoreAx、标题为空）不会被认成 WeGame。
+        /// </summary>
+        public static bool IsWeGameWindow(string proc, string title, string cls)
+        {
+            if (IsWeGame(proc)) return true;
+            if (Eq(proc, "pallas")) return true;
+            bool titleIsWeGame = title != null && title.IndexOf("WeGame", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (Eq(proc, "browser") && titleIsWeGame) return true;
+            if (titleIsWeGame && Eq(cls, "CefTopWindow")) return true;
+            return false;
+        }
+
+        private static bool Eq(string a, string b)
+        {
+            return string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        }
+    }
 }

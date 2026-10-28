@@ -25,6 +25,24 @@ internal static class LogicTest
         }
     }
 
+    private static void Class(string name, string proc, string title, string cls, bool expect)
+    {
+        bool actual = ProcClass.IsWeGameWindow(proc, title, cls);
+        Report(name, actual == expect, expect ? "算 WeGame" : "不算 WeGame", actual ? "算 WeGame" : "不算 WeGame");
+    }
+
+    private static void Client(string name, string proc, bool expect)
+    {
+        bool actual = ProcClass.IsClient(proc);
+        Report(name, actual == expect, expect ? "是客户端" : "不是客户端", actual ? "是客户端" : "不是客户端");
+    }
+
+    private static void Report(string name, bool ok, string expect, string actual)
+    {
+        if (ok) { _pass++; Console.WriteLine("  ok   " + name); }
+        else { _fail++; Console.WriteLine(string.Format("  FAIL {0}：期望 {1}，实际 {2}", name, expect, actual)); }
+    }
+
     /// <summary>基线：客户端自己跳前台、没有任何输入。</summary>
     private static DecisionFacts Idle()
     {
@@ -142,6 +160,20 @@ internal static class LogicTest
         f.FirstClientWindow = false;
         Case("客户端在跑，你自己点客户端窗口 → 放行", f, true, DecisionCode.AllowClickedTarget);
 
+        // ---- 窗口分类：WeGame 的界面跑在 browser/pallas 里，而 browser.exe 又被 QQ 用着 ----
+        Class("wegame.exe 的窗口 → WeGame", "wegame", "WeGame", "TWINCONTROL", true);
+        Class("wegame_env.exe 的窗口 → WeGame", "wegame_env", "", "TWINCONTROL", true);
+        Class("browser.exe 标题 WeGame（CEF 那条腿）→ WeGame", "browser", "WeGame", "CefTopWindow", true);
+        Class("browser.exe 标题 WeGame 商店（标题含前缀）→ WeGame", "browser", "WeGame 商城", "CefTopWindow", true);
+        Class("pallas.exe（内嵌网页宿主）→ WeGame", "pallas", "SIDE_WEB_VIEW", "TWINCONTROL", true);
+        Class("QQ 的 browser.exe（QBCoreAx、无标题）→ 不是 WeGame", "browser", "", "QBCoreAx", false);
+        Class("客户端窗口 → 不是 WeGame", "LeagueClientUx", "League of Legends", "RCLIENT", false);
+        Class("登录程序窗口 → 不是 WeGame", "Client", "英雄联盟登录程序", "TWINCONTROL", false);
+        Class("浏览器窗口 → 不是 WeGame", "msedge", "WeGame 官网 - Microsoft Edge", "Chrome_WidgetWin_1", false);
+        Class("任务栏 → 是 shell", "explorer", "", "Shell_TrayWnd", false);
+        Client("LeagueClientUx → 客户端", "LeagueClientUx", true);
+        Client("RiotClientServices → 客户端", "RiotClientServices", true);
+        Client("wegame → 不是客户端", "wegame", false);
         Console.WriteLine();
         Console.WriteLine(string.Format("结果: {0}，通过 {1}，失败 {2}", _fail == 0 ? "PASS" : "FAIL", _pass, _fail));
         Environment.ExitCode = _fail == 0 ? 0 : 1;

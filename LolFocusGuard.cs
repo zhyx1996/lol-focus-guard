@@ -555,27 +555,12 @@ namespace LolFocusGuard
             return ProcNameOf(root == IntPtr.Zero ? under : root);
         }
 
-        private static bool IsShellProcess(string proc)
-        {
-            return string.Equals(proc, "explorer", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(proc, "StartMenuExperienceHost", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(proc, "ShellExperienceHost", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(proc, "SearchHost", StringComparison.OrdinalIgnoreCase);
-        }
+        private static bool IsShellProcess(string proc) { return ProcClass.IsShell(proc); }
 
         // ---------- LCU 登录状态（只在本机 127.0.0.1 上调客户端自己的接口，不注入） ----------
-        private static bool IsClientProcess(string proc)
-        {
-            return string.Equals(proc, "LeagueClientUx", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(proc, "LeagueClient", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(proc, "RiotClientServices", StringComparison.OrdinalIgnoreCase);
-        }
+        private static bool IsClientProcess(string proc) { return ProcClass.IsClient(proc); }
 
-        private static bool IsWeGameProcess(string proc)
-        {
-            return string.Equals(proc, "wegame", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(proc, "wegame_env", StringComparison.OrdinalIgnoreCase);
-        }
+        private static bool IsWeGameProcess(string proc) { return ProcClass.IsWeGame(proc); }
 
         /// <summary>
         /// WeGame 自己的界面不是 wegame.exe 画的：实测它的页面跑在 browser.exe（class CefTopWindow、
@@ -585,15 +570,8 @@ namespace LolFocusGuard
         /// </summary>
         private static bool IsWeGameHelperWindow(string proc, string title, string cls)
         {
-            if (string.Equals(proc, "pallas", StringComparison.OrdinalIgnoreCase)) return true;
-            if (string.Equals(proc, "browser", StringComparison.OrdinalIgnoreCase))
-            {
-                // browser.exe 这名字太泛（QQ 也有一个），必须有 WeGame 的标题才算
-                if (title != null && title.IndexOf("WeGame", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-                if (string.Equals(cls, "CefTopWindow", StringComparison.OrdinalIgnoreCase) &&
-                    title != null && title.IndexOf("WeGame", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            }
-            return false;
+            // 判据本身是纯函数，放在 Rules.cs 的 ProcClass 里，LogicTest 有穷举用例
+            return ProcClass.IsWeGameWindow(proc, title, cls);
         }
 
         /// <summary>客户端进程在不在（WeGame 登录窗口只在客户端起来之前出现，用它当判据）。</summary>
