@@ -287,6 +287,9 @@ namespace LolFocusGuard
         private DateTime _lastModifierAt = DateTime.MinValue;
         private DateTime _lastClickAt = DateTime.MinValue;
         private string _lastClickWhere = "";
+        // 按下那一刻指针命中的窗口类名：用来把"点任务栏"和"点资源管理器文件夹窗口"分开
+        // （两者同属 explorer.exe，只看进程名分不出来）
+        private string _lastClickClass = "";
         private bool _mouseWasDown;
         private int _clickCount;
         private const int MODIFIER_GRACE_MS = FocusRules.ModifierGraceMs;
@@ -545,6 +548,7 @@ namespace LolFocusGuard
                     if (down && !_mouseWasDown)
                     {
                         _lastClickWhere = ProcUnderCursor();
+                        _lastClickClass = ClassUnderCursor();
                         _lastClickAt = DateTime.Now;
                         _clickCount++;
                     }
@@ -597,6 +601,32 @@ namespace LolFocusGuard
         }
 
         private static bool IsShellProcess(string proc) { return ProcClass.IsShell(proc); }
+
+        /// <summary>鼠标指针下面那个窗口的类名（用来区分「任务栏」和「资源管理器文件夹窗口」）。</summary>
+        private static string ClassUnderCursor()
+        {
+            Native.POINT pt;
+            if (!Native.GetCursorPos(out pt)) return string.Empty;
+            IntPtr under = Native.WindowFromPoint(pt);
+            if (under == IntPtr.Zero) return string.Empty;
+            // 任务栏是个容器：WindowFromPoint 命中的往往是里面的子窗口
+            // （Start / TrayNotifyWnd / MSTaskSwWClass…），往上找顶层窗口再取类名。
+            IntPtr h = under;
+            for (int i = 0; i < 4 && h != IntPtr.Zero; i++)
+            {
+                string cls = ClassNameOf(h);
+                if (IsTaskbarClass(cls)) return cls;
+                h = Native.GetAncestor(h, Native.GA_ROOT);
+            }
+            return ClassNameOf(under);
+        }
+
+        /// <summary>任务栏（主屏/副屏）。只有点它才享受"激活可能很慢"的长宽限。</summary>
+        private static bool IsTaskbarClass(string cls)
+        {
+            return string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase);
+        }
 
         // ---------- LCU 登录状态（只在本机 127.0.0.1 上调客户端自己的接口，不注入） ----------
         private static bool IsClientProcess(string proc) { return ProcClass.IsClient(proc); }
@@ -1040,10 +1070,13 @@ namespace LolFocusGuard
                 // 重试轮里窗口已经在最前面、指针必然压着它 —— 那一轮不能把"指针在它上面"算成你点的
                 string where = _lastClickWhere;
                 facts.ClickOnTarget = !retry && _targets.Contains(where);
-                // 任务栏/开始菜单的点击：从按下到窗口真正被激活往往要几百毫秒（客户端从最小化恢复
-                // 尤其慢），所以任务栏这一路单独给 2.5 秒宽限，否则「点任务栏把它叫出来」会被判成自弹。
-                facts.ClickOnShell = !retry && IsShellProcess(where) &&
-                                     facts.ClickAgeMs <= SHELL_CLICK_GRACE_MS;
+                // 点任务栏：从按下到窗口真正被激活往往要几百毫秒（客户端从最小化恢复尤其慢），
+                // 所以任务栏这一路单独给 2.5 秒宽限，否则「点任务栏把它叫出来」会被当场判成自弹。
+                // 但只认"真的点在任务栏上"（Shell_TrayWnd / Shell_SecondaryTrayWnd）：点资源管理器
+                // 的文件夹窗口、桌面图标也是 explorer 进程，那不能算"你要切到客户端"，
+                // 否则客户端自弹会搭这趟顺风车漏过去。
+                bool clickOnTaskbar = IsShellProcess(where) && IsTaskbarClass(_lastClickClass);
+                facts.ClickOnShell = !retry && clickOnTaskbar && facts.ClickAgeMs <= SHELL_CLICK_GRACE_MS;
                 if (facts.ClickOnShell) facts.ClickAgeMs = Math.Min(facts.ClickAgeMs, FocusRules.ClickGraceMs);
                 facts.PrevWindowGone = _lastForeground != IntPtr.Zero && _lastForeground != hwnd &&
                                        !Native.IsWindow(_lastForeground);

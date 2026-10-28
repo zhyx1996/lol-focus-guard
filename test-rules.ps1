@@ -17,8 +17,24 @@ Copy-Item (Join-Path $root 'FakeClient.exe') (Join-Path $tmp 'RiotClientServices
 Copy-Item (Join-Path $root 'FakeClient.exe') (Join-Path $tmp 'wegame.exe') -Force
 
 $guardLog = Join-Path $env:LOCALAPPDATA 'LolFocusGuard\guard.log'
-Get-Process LolFocusGuard, RiotClientServices, wegame -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$tmp*" -or $_.ProcessName -eq 'LolFocusGuard' } | Stop-Process -Force
-Get-Process RiotClientServices, wegame -ErrorAction SilentlyContinue | Stop-Process -Force
+# 只停"我们自己造出来的"进程（按可执行文件路径过滤），绝不按进程名批量杀 ——
+# 这台机器上真的可能开着 wegame.exe / RiotClientServices.exe，误杀就是把用户正在用的东西关了。
+function Stop-Mine($names) {
+    Get-Process $names -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($tmp, [StringComparison]::OrdinalIgnoreCase) } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
+# 真机上真的可能开着 wegame.exe / RiotClientServices.exe：只要发现"不是我们造的"同名进程，
+# 就跳过本测试 —— 因为守卫是按进程名匹配目标的，跑下去会把用户真实的 WeGame/客户端当成靶子。
+$foreign = Get-Process RiotClientServices, wegame -ErrorAction SilentlyContinue |
+    Where-Object { -not $_.Path -or -not $_.Path.StartsWith($tmp, [StringComparison]::OrdinalIgnoreCase) }
+if ($foreign) {
+    "跳过：这台机器上正开着真实的 " + (($foreign | ForEach-Object { $_.ProcessName }) -join ', ') + "，跑下去会误伤，不测这条链。"
+    '结果: SKIP'
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    exit 0
+}
+Stop-Mine @('LolFocusGuard', 'RiotClientServices', 'wegame')
 Start-Sleep -Milliseconds 600
 
 $client = Start-Process (Join-Path $tmp 'RiotClientServices.exe') -PassThru

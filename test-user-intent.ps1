@@ -5,7 +5,7 @@
 # 把你刚叫出来的窗口最小化，于是你得反复点。
 #
 # 做法（确定性，不依赖输入注入）：
-#   把测试窗口的进程名伪装成 LeagueClientUx，这样它第一次出现时守卫会按
+#   把测试窗口的进程名伪装成 RiotClientServices，这样它第一次出现时守卫会按
 #   「客户端窗口第一次出现」放行 —— 等价于"你自己把它叫出来"。
 #   A) 放行后 3 秒内连续把它抬到前台 3 次：一次都不许拦、不许最小化。
 #   B) 等放行保护过期（>3.2 秒）后再抬一次：必须重新开始拦。
@@ -60,19 +60,19 @@ $repo = $PSScriptRoot
 $guardLog = Join-Path $env:LOCALAPPDATA 'LolFocusGuard\guard.log'
 $fake = Join-Path $env:TEMP 'lfg-fakeclient'
 New-Item -ItemType Directory -Path $fake -Force | Out-Null
-Copy-Item (Join-Path $repo 'PopTarget.exe') (Join-Path $fake 'LeagueClientUx.exe') -Force
+Copy-Item (Join-Path $repo 'PopTarget.exe') (Join-Path $fake 'RiotClientServices.exe') -Force
 Copy-Item (Join-Path $repo 'PopTarget.exe') (Join-Path $fake 'BgWin.exe') -Force
 
-Get-Process LolFocusGuard, LeagueClientUx, PopTarget, BgWin -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process LolFocusGuard, RiotClientServices, PopTarget, BgWin -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 Remove-Item $guardLog -ErrorAction SilentlyContinue
 
 $pass = $true
 
-$guard = Start-Process (Join-Path $repo 'LolFocusGuard.exe') -ArgumentList '--targets=LeagueClientUx', '--verbose' -PassThru
+$guard = Start-Process (Join-Path $repo 'LolFocusGuard.exe') -ArgumentList '--targets=RiotClientServices', '--verbose' -PassThru
 Start-Sleep -Seconds 2
 $bg = Start-Process (Join-Path $fake 'BgWin.exe') -ArgumentList 'bg', 300, 700 -PassThru
-$target = Start-Process (Join-Path $fake 'LeagueClientUx.exe') -ArgumentList 'target', 300, 200 -PassThru
+$target = Start-Process (Join-Path $fake 'RiotClientServices.exe') -ArgumentList 'target', 300, 200 -PassThru
 Start-Sleep -Seconds 2
 $bgH = [UI1]::TopOf($bg.Id)
 $ptH = [UI1]::TopOf($target.Id)
@@ -82,6 +82,19 @@ $all = Get-Content $guardLog -Raw
 if ($all -notmatch '客户端窗口第一次出现') {
     "断言失败：测试窗口第一次出现时没有被放行（A 阶段前提不成立）"
     ($all -split "`r?`n" | Select-Object -Last 8)
+}
+
+# 前提检查：必须能真的把窗口抬到前台，否则"0 拦截"是假通过
+# （比如用户在打原神/全屏游戏，AttachThreadInput+SetForegroundWindow 会被系统拒掉，
+#   前台根本没变化，守卫自然不会拦 —— 那不是守卫的功劳）。
+[void][UI1]::Raise($bgH)
+Start-Sleep -Milliseconds 300
+if ([UI1]::FgProc() -ne 'BgWin') {
+    "跳过：前台切不动（现在是 " + [UI1]::FgProc() + "，可能在全屏游戏/独占前台），"
+    '      这种情况下"没拦"不能算通过，不做结论。'
+    Stop-Process -Id $guard.Id, $bg.Id, $target.Id -Force -ErrorAction SilentlyContinue
+    '结果: SKIP'
+    exit 0
 }
 
 # ---------- A) 放行之后 3 秒内连抬 3 次：不许拦、不许最小化 ----------
