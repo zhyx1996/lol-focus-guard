@@ -271,6 +271,10 @@ namespace LolFocusGuard
         private int _inputCount;
         private volatile int _inputAgeMs = int.MaxValue; // 最后一次输入距今（系统级，不信钩子）
         // 防拉锯：同一窗口 10 秒内被拦太多次就放弃拦截 60 秒
+        private string _cursorProcNow = "";
+        private string _cursorProcPrev = "";
+        private DateTime _lastAllowAt = DateTime.MinValue;
+        private IntPtr _lastAllowHwnd = IntPtr.Zero;
         private volatile int _clientBlockSeq;
         private volatile string _lastClientBlockTitle = "";
         private IntPtr _streakHwnd = IntPtr.Zero;
@@ -280,6 +284,7 @@ namespace LolFocusGuard
         // Alt / Win 最后一次按下的时间：这两个键才是"切窗口"用的
         private DateTime _lastModifierAt = DateTime.MinValue;
         private const int MODIFIER_GRACE_MS = FocusRules.ModifierGraceMs;
+        private const int JUST_ALLOWED_MS = 800; // 刚放行过的窗口，这段时间内不再压回去
 
         public Guard(IEnumerable<string> targets, string logPath, bool verbose, bool noClickAllow,
             string lcuDir)
@@ -410,6 +415,11 @@ namespace LolFocusGuard
                 // 这是不依赖任何钩子的系统级事实，安全软件（WeGame 的 ACE / SGuard）拦不住。
                 UpdateInputState();
 
+                // 指针下面是谁：每轮(50ms)采一次，并留一份上一轮的。
+                // 判定"是不是你点的"时用上一轮的值 —— 理由见 ProcessForeground 里的注释。
+                _cursorProcPrev = _cursorProcNow;
+                _cursorProcNow = ProcUnderCursor();
+
                 // 每 4 个 tick 扫一遍目标进程的窗口，记下谁现在是最小化的
                 if ((_scanTick++ % 4) == 0) ScanIconic();
                 if ((_scanTick % 20) == 0) RefreshClientRunning();
@@ -429,14 +439,18 @@ namespace LolFocusGuard
                 IntPtr fg = Native.GetForegroundWindow();
                 if (fg != _lastFgHwnd)
                 {
-                    ProcessForeground(fg);
+                    ProcessForeground(fg, false);
                 }
                 else if (fg != IntPtr.Zero && fg == _targetHwnd && _lastBlockAt != DateTime.MinValue &&
                          (DateTime.Now - _lastBlockAt).TotalMilliseconds > 1200)
                 {
-                    // 目标窗口一直赖在前台没被打回去：每隔 1.2 秒再试一次
-                    _lastFgHwnd = IntPtr.Zero;
-                    ProcessForeground(fg);
+                    // 目标窗口一直赖在前台没被打回去：每隔 1.2 秒再试一次。
+                    // 但你 3 秒内刚放行过它（说明是你自己点开的）就别再压了。
+                    if ((DateTime.Now - _lastAllowAt).TotalMilliseconds > 3000)
+                    {
+                        _lastFgHwnd = IntPtr.Zero;
+                        ProcessForeground(fg, true);
+                    }
                 }
 
                 if (_verbose && (_pollTicks++ % 20) == 0)
@@ -561,6 +575,25 @@ namespace LolFocusGuard
         {
             return string.Equals(proc, "wegame", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(proc, "wegame_env", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// WeGame 自己的界面不是 wegame.exe 画的：实测它的页面跑在 browser.exe（class CefTopWindow、
+        /// 标题 "WeGame"）和 pallas.exe（class TWINCONTROL、标题 SIDE_WEB_VIEW）里。
+        /// 只看进程名会漏掉这些窗口 —— "游戏进程已启动"那张卡片就是这么漏过去的。
+        /// 所以再加一条"按窗口标题/类名认"，和 wegame.exe 一视同仁。
+        /// </summary>
+        private static bool IsWeGameHelperWindow(string proc, string title, string cls)
+        {
+            if (string.Equals(proc, "pallas", StringComparison.OrdinalIgnoreCase)) return true;
+            if (string.Equals(proc, "browser", StringComparison.OrdinalIgnoreCase))
+            {
+                // browser.exe 这名字太泛（QQ 也有一个），必须有 WeGame 的标题才算
+                if (title != null && title.IndexOf("WeGame", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (string.Equals(cls, "CefTopWindow", StringComparison.OrdinalIgnoreCase) &&
+                    title != null && title.IndexOf("WeGame", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            }
+            return false;
         }
 
         /// <summary>客户端进程在不在（WeGame 登录窗口只在客户端起来之前出现，用它当判据）。</summary>
@@ -849,7 +882,7 @@ namespace LolFocusGuard
             {
                 _lastEventLatencyMs = -1;
             }
-            ProcessForeground(hwnd);
+            ProcessForeground(hwnd, false);
         }
 
         /// <summary>把动作丢给专用线程（比线程池快，通常 1–3ms 内执行）。</summary>
@@ -914,7 +947,11 @@ namespace LolFocusGuard
             return name;
         }
 
-        private void ProcessForeground(IntPtr hwnd)
+        /// <param name="retry">
+        /// true = "目标窗口赖在前台不动，再过一遍"的重试。重试时窗口已经在最前面了，
+        /// 指针多半就压在它身上，所以绝不能把「指针在它上面」当成你点的。
+        /// </param>
+        private void ProcessForeground(IntPtr hwnd, bool retry)
         {
             if (hwnd == IntPtr.Zero) return;
             if (hwnd == _lastFgHwnd) return; // 这次切换已经处理过
@@ -925,7 +962,12 @@ namespace LolFocusGuard
                 _lastFgHwnd = hwnd;
 
                 string proc = ProcNameOfCached(hwnd);
-                bool isTarget = _targets.Contains(proc);
+                string title = TitleOf(hwnd);
+                string cls = ClassNameOf(hwnd);
+                // 目标 = 静态名单里的进程，或者"客户端在跑时冒出来的 WeGame 窗口"
+                // （WeGame 的界面跑在 browser/pallas 里，光按进程名认会漏）。
+                bool isWeGameWin = IsWeGameProcess(proc) || IsWeGameHelperWindow(proc, title, cls);
+                bool isTarget = _targets.Contains(proc) || (isWeGameWin && _clientRunning);
 
                 if (_verbose)
                 {
@@ -963,20 +1005,29 @@ namespace LolFocusGuard
                 // 注意：这个方法有副作用（记住"这个窗口见过了"），必须调用
                 facts.FirstClientWindow = IsFirstClientWindow(hwnd, proc);
                 facts.Suppressed = IsSuppressed(hwnd);
+                // 刚刚(800ms 内)才放行过这个窗口 → 别再压回去（"我刚点开你就给我最小化"）
+                facts.RecentlyAllowed = hwnd == _lastAllowHwnd &&
+                                        (DateTime.Now - _lastAllowAt).TotalMilliseconds < JUST_ALLOWED_MS;
                 facts.ModifierIdleMs = (DateTime.Now - _lastModifierAt).TotalMilliseconds;
                 facts.InputAgeMs = _inputAgeMs;
                 facts.PrevWindowGone = _lastForeground != IntPtr.Zero && _lastForeground != hwnd &&
                                        !Native.IsWindow(_lastForeground);
 
-                // 输入落在谁身上：钩子活着时用"按下那一刻指针在哪"（最准）；
-                // 钩子被安全软件掐掉时退回到"此刻指针在哪"——点击时指针不会动，两者等价。
+                // 输入落在谁身上。两个坑：
+                //  (a) 钩子活着时用"按下那一刻指针在哪"，最准；
+                //  (b) 钩子被 ACE 掐掉时只能退回到指针位置 —— 但绝不能用"此刻"的指针位置：
+                //      客户端(或 WeGame)自己弹到前台时窗口会盖在指针下面，"此刻指针在目标上"
+                //      就被当成"你点了它"，于是自发弹窗一次都拦不住（真机上就是这么漏的）。
+                //      改用上一轮轮询(50ms 前)的指针位置：弹窗刚冒出来那一瞬间，指针下面
+                //      还是你原来的窗口，判得对。
                 string where = _lastInputWhere;
                 if ((DateTime.Now - _lastInputAt).TotalMilliseconds > INPUT_GRACE_MS || where.Length == 0)
                 {
-                    where = ProcUnderCursor();
+                    where = _cursorProcPrev.Length > 0 ? _cursorProcPrev : ProcUnderCursor();
                 }
-                facts.InputOnTarget = _targets.Contains(where);
-                facts.InputOnShell = IsShellProcess(where);
+                // 重试轮里窗口已经在最前面，指针几乎必然压着它 —— 这时"指针在它上面"不能算你点的。
+                facts.InputOnTarget = !retry && _targets.Contains(where);
+                facts.InputOnShell = !retry && IsShellProcess(where);
 
                 Decision decision = FocusRules.Decide(facts);
                 LogDecision(decision, hwnd, where);
@@ -1006,6 +1057,9 @@ namespace LolFocusGuard
                     break;
                 case DecisionCode.AllowSuppressed:
                     if (_verbose) Log("放行原因: 正在放弃拦截期（刚才拦太多次）");
+                    break;
+                case DecisionCode.AllowJustAllowed:
+                    if (_verbose) Log("放行原因: 刚放行过这个窗口（800ms 内不重复压回去）");
                     break;
                 case DecisionCode.AllowModifier:
                     if (_verbose) Log("放行原因: Alt/Win 切换");

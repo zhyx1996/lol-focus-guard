@@ -26,7 +26,15 @@ internal static class Program
         f.Width = 420;
         f.Height = 260;
         f.StartPosition = FormStartPosition.Manual;
-        f.Location = target ? new Point(200, 150) : new Point(200, 700);
+        // 可选：PopTarget.exe target 600 450 —— 指定窗口左上角（用来把窗口摆到鼠标指针底下）
+        int px = target ? 200 : 200;
+        int py = target ? 150 : 700;
+        if (args.Length >= 3)
+        {
+            int.TryParse(args[1], out px);
+            int.TryParse(args[2], out py);
+        }
+        f.Location = new Point(px, py);
         f.TopMost = true; // 保证在最上面，模拟点击一定落在它身上
 
         if (target)

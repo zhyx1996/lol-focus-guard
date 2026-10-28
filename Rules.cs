@@ -19,6 +19,9 @@ namespace LolFocusGuard
         /// <summary>这个窗口正在"放弃拦截"期里（防拉锯）。</summary>
         public bool Suppressed;
 
+        /// <summary>刚刚才放行过这个窗口（你点了它，客户端内部又抢了一次焦点）。</summary>
+        public bool RecentlyAllowed;
+
         /// <summary>上一次按 Alt/Win 距今多少毫秒。</summary>
         public double ModifierIdleMs = double.MaxValue;
 
@@ -41,6 +44,7 @@ namespace LolFocusGuard
         AllowWeGameLogin,
         AllowFirstClientWindow,
         AllowSuppressed,
+        AllowJustAllowed,
         AllowModifier,
         AllowPrevWindowGone,
         AllowClickedTarget,
@@ -83,6 +87,10 @@ namespace LolFocusGuard
 
             // 3) 正在防拉锯的放弃期里
             if (f.Suppressed) return new Decision(true, DecisionCode.AllowSuppressed);
+
+            // 3.5) 刚刚才放行过这个窗口：你点它 → 它内部又自己抢了一次焦点。
+            //      这里压回去的观感就是"我刚点开你就给我最小化"，所以干脆不压。
+            if (f.RecentlyAllowed) return new Decision(true, DecisionCode.AllowJustAllowed);
 
             // 4) 刚按过 Alt / Win（切窗口专用键）
             if (f.ModifierIdleMs <= ModifierGraceMs) return new Decision(true, DecisionCode.AllowModifier);

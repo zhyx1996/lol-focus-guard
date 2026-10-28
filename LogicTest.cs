@@ -99,6 +99,25 @@ internal static class LogicTest
         f.Suppressed = true;
         Case("正在防拉锯放弃期 → 放行（不再跟它拉锯）", f, true, DecisionCode.AllowSuppressed);
 
+        // ---- 放行：刚放行过的窗口 ----
+        // 真机上踩到的：你点了客户端（放行），客户端内部又自己抢了一次焦点，
+        // 800ms 内再压回去的观感就是"我刚点开你就给我最小化"。
+        f = Idle();
+        f.RecentlyAllowed = true;
+        Case("刚放行过的窗口又自己抢前台（800ms 内）→ 放行，不再压回去", f, true, DecisionCode.AllowJustAllowed);
+
+        f = Idle();
+        f.RecentlyAllowed = true;
+        f.InputAgeMs = 100;
+        f.InputOnTarget = false;
+        Case("刚放行过（800ms 内）优先于「输入落在别处」→ 仍放行", f, true, DecisionCode.AllowJustAllowed);
+
+        f = Idle();
+        f.RecentlyAllowed = true;
+        f.Suppressed = false;
+        f.TestModeOnly = true;
+        Case("测试模式优先于「刚放行过」→ 还是拦", f, false, DecisionCode.BlockTestMode);
+
         // ---- 测试模式 ----
         f = Idle();
         f.TestModeOnly = true;
