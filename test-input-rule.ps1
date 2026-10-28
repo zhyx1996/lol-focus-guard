@@ -43,9 +43,18 @@ public class T4 {
     System.Threading.Thread.Sleep(50);
     SendInput(1, u, Marshal.SizeOf(typeof(INPUT)));
   }
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
   public static void ClickWindow(IntPtr h) {
+    // 浏览器是全屏 TopMost（用户开着），我们的测试窗口得先顶到 TopMost 组最前面，不然点下去是点在浏览器上
+    SetWindowPos(h, (IntPtr)(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040);
+    System.Threading.Thread.Sleep(200);
     RECT r; GetWindowRect(h, out r);
     ClickAt((r.Left + r.Right) / 2, (r.Top + r.Bottom) / 2);
+  }
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  public static void Restore(IntPtr h) {
+    if (IsIconic(h)) { ShowWindow(h, 9); System.Threading.Thread.Sleep(150); }
   }
   public static string FgProc() {
     uint pid; GetWindowThreadProcessId(GetForegroundWindow(), out pid);
@@ -104,7 +113,7 @@ if ($injectOk) {
     $lines = @($partA -split "`r?`n" | Where-Object { $_.Trim() })
     $idx = -1
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '前台变化 → PopTarget' -and $lines[$i] -match '有输入=True') { $idx = $i; break }
+        if ($lines[$i] -match '前台变化 → PopTarget' -and $lines[$i] -match '按键=[0-9]+ms前@PopTarget') { $idx = $i; break }
     }
     if ($idx -lt 0) { 'A 结果: 未知（点击没产生前台切换，看上面日志）' }
     elseif ($idx + 1 -lt $lines.Count -and $lines[$idx + 1] -match '拦截 #') { 'A 结果: FAIL（用户点击被拦了）' }

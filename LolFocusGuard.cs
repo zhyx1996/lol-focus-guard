@@ -222,8 +222,6 @@ namespace LolFocusGuard
         private volatile bool _targetWasMinimized;
         private volatile bool _paused;
         private DateTime _resumeAt = DateTime.MinValue;
-        private DateTime _lastClickAt = DateTime.MinValue;
-        private string _lastClickProc = string.Empty;
         private int _blockCount;
         private DateTime _lastIconicAt = DateTime.MinValue;
         // 每个目标窗口"上一次处于最小化"的时间，用来判断弹出来的那一刻它是不是从最小化状态恢复的
@@ -261,7 +259,7 @@ namespace LolFocusGuard
 
         // ---- 低级输入钩子：区分"你自己切过去的"和"进程强制抢前台" ----
         // 判定用的两个时间窗口只有一份定义（在 Rules.cs），这里只是别名，避免两边改漏一边
-        private const int INPUT_GRACE_MS = FocusRules.InputGraceMs; // 最后一次输入后多久内算"用户操作引起"
+        private const int CLICK_GRACE_MS = FocusRules.ClickGraceMs; // 按键按下后多久内算"这次切换是你点的"
         private IntPtr _mouseHook = IntPtr.Zero;
         private IntPtr _kbdHook = IntPtr.Zero;
         private Native.LowLevelHookProc _mouseProc;
@@ -275,14 +273,16 @@ namespace LolFocusGuard
         private string _cursorProcPrev = "";
         private DateTime _lastAllowAt = DateTime.MinValue;
         private IntPtr _lastAllowHwnd = IntPtr.Zero;
-        private volatile int _clientBlockSeq;
-        private volatile string _lastClientBlockTitle = "";
         private IntPtr _streakHwnd = IntPtr.Zero;
         private int _streakCount;
         private DateTime _streakAt = DateTime.MinValue;
         private readonly Dictionary<IntPtr, DateTime> _suppressedUntil = new Dictionary<IntPtr, DateTime>();
         // Alt / Win 最后一次按下的时间：这两个键才是"切窗口"用的
         private DateTime _lastModifierAt = DateTime.MinValue;
+        private DateTime _lastClickAt = DateTime.MinValue;
+        private string _lastClickWhere = "";
+        private bool _mouseWasDown;
+        private int _clickCount;
         private const int MODIFIER_GRACE_MS = FocusRules.ModifierGraceMs;
         private const int JUST_ALLOWED_MS = 800; // 刚放行过的窗口，这段时间内不再压回去
 
@@ -329,6 +329,11 @@ namespace LolFocusGuard
             _pollThread.Start();
 
             _actionThread = new System.Threading.Thread(ActionLoop);
+            System.Threading.Thread clickThread = new System.Threading.Thread(ClickWatchLoop);
+            clickThread.IsBackground = true;
+            clickThread.Priority = System.Threading.ThreadPriority.AboveNormal;
+            clickThread.Start();
+
             _actionThread.IsBackground = true;
             _actionThread.Priority = System.Threading.ThreadPriority.Highest;
             _actionThread.Name = "LolFocusGuard-action";
@@ -347,8 +352,8 @@ namespace LolFocusGuard
             }
             else
             {
-                Log(string.Format("判定依据: GetLastInputInfo（{0}ms 内有输入算你自己操作）+ 指针位置；低级钩子{1}",
-                    INPUT_GRACE_MS, (_mouseHook != IntPtr.Zero && _kbdHook != IntPtr.Zero) ? "已安装（可能被 WeGame 的 ACE 掐掉，不影响判定）" : "没装上（不影响判定）"));
+                Log(string.Format("判定依据: 鼠标按键（{0}ms 内按下过就算你切的）+ 按下那一刻的指针位置；硬件状态读得到，ACE 掐不掉；低级钩子{1}",
+                    CLICK_GRACE_MS, (_mouseHook != IntPtr.Zero && _kbdHook != IntPtr.Zero) ? "已安装（可能被 WeGame 的 ACE 掐掉，不影响判定）" : "没装上（不影响判定）"));
             }
         }
 
@@ -356,12 +361,6 @@ namespace LolFocusGuard
         public bool Paused { get { return _paused; } }
         public DateTime ResumeAt { get { return _resumeAt; } }
         public string LogPath { get { return _logPath; } }
-
-        /// <summary>拦下"客户端自己抢前台"的次数（只算客户端进程，不算 WeGame）。托盘用它弹提示。</summary>
-        public int ClientBlockSeq { get { return _clientBlockSeq; } }
-
-        /// <summary>最近一次被拦下的客户端窗口标题。</summary>
-        public string LastClientBlockTitle { get { return _lastClientBlockTitle; } }
 
 
         /// <summary>暂停一段时间（到点自动恢复）。</summary>
@@ -455,11 +454,12 @@ namespace LolFocusGuard
 
                 if (_verbose && (_pollTicks++ % 20) == 0)
                 {
-                    Log(string.Format("心跳 fg={0} 输入={1}次 最后输入={2}ms前({3}) 钩子={4}",
-                        ProcNameOf(fg), _inputCount,
+                    Log(string.Format("心跳 fg={0} 按键={1} 钩子输入={2}次 钩子最后输入={3}ms前({4})",
+                        ProcNameOf(fg),
+                        _lastClickAt == DateTime.MinValue ? "没按过" : string.Format("{0:0}ms前@{1}", (DateTime.Now - _lastClickAt).TotalMilliseconds, _lastClickWhere.Length > 0 ? _lastClickWhere : "?"),
+                        _inputCount,
                         _inputAgeMs,
-                        _lastInputWhere.Length > 0 ? _lastInputWhere : "-",
-                        (_mouseHook != IntPtr.Zero && _kbdHook != IntPtr.Zero) ? "ok" : "缺失"));
+                        _lastInputWhere.Length > 0 ? _lastInputWhere : "-"));
                 }
             }
             catch
@@ -505,16 +505,46 @@ namespace LolFocusGuard
             }
         }
 
-        private static bool UnusedIsMouseButtonDown()
+        /// <summary>鼠标左/右键此刻是不是按着（读硬件状态，不需要钩子）。</summary>
+        private static bool IsMouseButtonDown()
         {
-            const int VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_MBUTTON = 0x04, VK_XBUTTON1 = 0x05, VK_XBUTTON2 = 0x06;
+            const int VK_LBUTTON = 0x01, VK_RBUTTON = 0x02;
             return (Native.GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
-                || (Native.GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0
-                || (Native.GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0
-                || (Native.GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0
-                || (Native.GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0;
+                || (Native.GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
         }
 
+        /// <summary>
+        /// 专盯「鼠标真的按下去」这一刻（15ms 采一次）。
+        ///
+        /// 这是区分「你手动切窗口」和「它自己抢前台」最硬的证据：
+        ///   手动切窗口 —— 点任务栏按钮、点客户端窗口、点通知 —— 一定伴随一次按键按下；
+        ///   它自己抢前台 —— 那一下没有任何按键。
+        ///
+        /// 不用"最近有没有输入"当判据的原因：鼠标随手一动也算输入，太粗。
+        /// 钩子会被 WeGame 的 ACE 掐掉，GetAsyncKeyState 不会 —— 它读的是硬件状态。
+        /// 按下瞬间同时记下"指针落在谁身上"，就等于知道了"你点的是哪个窗口"。
+        /// </summary>
+        private void ClickWatchLoop()
+        {
+            while (true)
+            {
+                try
+                {
+                    bool down = IsMouseButtonDown();
+                    if (down && !_mouseWasDown)
+                    {
+                        _lastClickWhere = ProcUnderCursor();
+                        _lastClickAt = DateTime.Now;
+                        _clickCount++;
+                    }
+                    _mouseWasDown = down;
+                }
+                catch
+                {
+                }
+                System.Threading.Thread.Sleep(15);
+            }
+        }
         /// <summary>
         /// 每 50ms 更新一次：最后一次输入距今多少毫秒、Alt/Win 是不是按着。
         /// 用 GetLastInputInfo + GetAsyncKeyState，不依赖低级钩子 ——
@@ -953,10 +983,13 @@ namespace LolFocusGuard
                     string size = Native.GetWindowRect(hwnd, out vr)
                         ? string.Format("{0}x{1}@({2},{3})", vr.Right - vr.Left, vr.Bottom - vr.Top, vr.Left, vr.Top)
                         : "?";
-                    Log(string.Format("前台变化 → {0} (pid={1}) class={2} 标题=\"{3}\" 尺寸={4} 最小化={5} 有输入={6}({7})",
+                    Log(string.Format("前台变化 → {0} (pid={1}) class={2} 标题=\"{3}\" 尺寸={4} 最小化={5} 按键={6}",
                         proc, ProcIdOf(hwnd), ClassNameOf(hwnd), TitleOf(hwnd), size,
                         Native.IsIconic(hwnd),
-                        (DateTime.Now - _lastInputAt).TotalMilliseconds <= INPUT_GRACE_MS, _lastInputWhere));
+                        _lastClickAt == DateTime.MinValue
+                            ? "没按过"
+                            : string.Format("{0:0}ms前@{1}", (DateTime.Now - _lastClickAt).TotalMilliseconds,
+                                _lastClickWhere.Length > 0 ? _lastClickWhere : "?")));
                 }
 
                 if (!isTarget)
@@ -987,25 +1020,15 @@ namespace LolFocusGuard
                 facts.RecentlyAllowed = hwnd == _lastAllowHwnd &&
                                         (DateTime.Now - _lastAllowAt).TotalMilliseconds < JUST_ALLOWED_MS;
                 facts.ModifierIdleMs = (DateTime.Now - _lastModifierAt).TotalMilliseconds;
-                facts.InputAgeMs = _inputAgeMs;
+                // 「你手动切窗口」的硬证据：鼠标物理按键真的按下了（ClickWatchLoop 每 15ms 采一次），
+                // 以及按下那一刻指针落在谁身上。它自己抢前台的时候一个按键都没有，这条能把两者分开。
+                facts.ClickAgeMs = (DateTime.Now - _lastClickAt).TotalMilliseconds;
+                // 重试轮里窗口已经在最前面、指针必然压着它 —— 那一轮不能把"指针在它上面"算成你点的
+                string where = _lastClickWhere;
+                facts.ClickOnTarget = !retry && _targets.Contains(where);
+                facts.ClickOnShell = !retry && IsShellProcess(where);
                 facts.PrevWindowGone = _lastForeground != IntPtr.Zero && _lastForeground != hwnd &&
                                        !Native.IsWindow(_lastForeground);
-
-                // 输入落在谁身上。两个坑：
-                //  (a) 钩子活着时用"按下那一刻指针在哪"，最准；
-                //  (b) 钩子被 ACE 掐掉时只能退回到指针位置 —— 但绝不能用"此刻"的指针位置：
-                //      客户端(或 WeGame)自己弹到前台时窗口会盖在指针下面，"此刻指针在目标上"
-                //      就被当成"你点了它"，于是自发弹窗一次都拦不住（真机上就是这么漏的）。
-                //      改用上一轮轮询(50ms 前)的指针位置：弹窗刚冒出来那一瞬间，指针下面
-                //      还是你原来的窗口，判得对。
-                string where = _lastInputWhere;
-                if ((DateTime.Now - _lastInputAt).TotalMilliseconds > INPUT_GRACE_MS || where.Length == 0)
-                {
-                    where = _cursorProcPrev.Length > 0 ? _cursorProcPrev : ProcUnderCursor();
-                }
-                // 重试轮里窗口已经在最前面，指针几乎必然压着它 —— 这时"指针在它上面"不能算你点的。
-                facts.InputOnTarget = !retry && _targets.Contains(where);
-                facts.InputOnShell = !retry && IsShellProcess(where);
 
                 Decision decision = FocusRules.Decide(facts);
                 LogDecision(decision, hwnd, where);
@@ -1051,11 +1074,17 @@ namespace LolFocusGuard
                 case DecisionCode.AllowClickedShell:
                     if (_verbose) Log("放行原因: 你点了任务栏/开始菜单（" + where + "）");
                     break;
-                case DecisionCode.BlockNoInput:
-                    if (_verbose) Log(string.Format("不放行: {0}ms 没有输入", _inputAgeMs));
+                case DecisionCode.BlockNoClick:
+                    if (_verbose)
+                    {
+                        Log(_lastClickAt == DateTime.MinValue
+                            ? "不放行: 鼠标一次都没按过（它是自己弹的）"
+                            : string.Format("不放行: {0:0}ms 内没有鼠标按键按下（它是自己弹的）",
+                                (DateTime.Now - _lastClickAt).TotalMilliseconds));
+                    }
                     break;
-                case DecisionCode.BlockInputElsewhere:
-                    if (_verbose) Log("不放行: 刚才的输入落在别的程序上（" + (where.Length > 0 ? where : "?") + "）");
+                case DecisionCode.BlockClickElsewhere:
+                    if (_verbose) Log("不放行: 按键按下时指针在别的程序上（" + (where.Length > 0 ? where : "?") + "）");
                     break;
                 case DecisionCode.BlockTestMode:
                     break;
@@ -1226,14 +1255,6 @@ namespace LolFocusGuard
                 number, proc, pid, wasMinimized ? "是" : "否",
                 escalating ? "，连续弹" : "", cls, title, size,
                 latency >= 0 ? latency.ToString() : "?"));
-
-            // 客户端自己抢前台（多半是"匹配成功/对局已开始"）：记一笔，托盘据此弹提示，
-            // 免得你完全不知道排到人了。
-            if (IsClientProcess(proc))
-            {
-                _lastClientBlockTitle = title;
-                _clientBlockSeq++;
-            }
 
             QueueAction(delegate
             {
@@ -1510,9 +1531,6 @@ namespace LolFocusGuard
         private readonly ToolStripMenuItem _countItem;
         private readonly HotkeyWindow _hotkeyWindow;
         private readonly System.Windows.Forms.Timer _uiTimer;
-        private int _notifiedSeq;
-        private bool _balloonEnabled = true;
-        private DateTime _lastBalloonAt = DateTime.MinValue;
 
         public TrayApp(Guard guard)
         {
@@ -1530,12 +1548,6 @@ namespace LolFocusGuard
             pause30.Click += delegate { _guard.Pause(TimeSpan.FromMinutes(30)); UpdateUi(); };
             ToolStripMenuItem resume = new ToolStripMenuItem("恢复运行");
             resume.Click += delegate { _guard.Resume(); UpdateUi(); };
-            ToolStripMenuItem balloonItem = new ToolStripMenuItem("气泡提示: 开");
-            balloonItem.Click += delegate
-            {
-                _balloonEnabled = !_balloonEnabled;
-                balloonItem.Text = _balloonEnabled ? "气泡提示: 开" : "气泡提示: 关";
-            };
             ToolStripMenuItem openLog = new ToolStripMenuItem("打开日志");
             openLog.Click += delegate
             {
@@ -1551,8 +1563,6 @@ namespace LolFocusGuard
             _menu.Items.Add(pause5);
             _menu.Items.Add(pause30);
             _menu.Items.Add(resume);
-            _menu.Items.Add(new ToolStripSeparator());
-            _menu.Items.Add(balloonItem);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(openLog);
             _menu.Items.Add(exit);
@@ -1605,22 +1615,6 @@ namespace LolFocusGuard
                     _icon.Text = "LOL 焦点守卫：运行中";
                 }
                 _countItem.Text = string.Format("已拦截: {0} 次", _guard.BlockCount);
-
-                // 客户端自己抢前台被拦了（多半是"匹配成功"）：弹个托盘提示，
-                // 免得你以为没排到人。20 秒最多弹一次，别刷屏。
-                int seq = _guard.ClientBlockSeq;
-                if (seq != _notifiedSeq)
-                {
-                    _notifiedSeq = seq;
-                    if (_balloonEnabled && (DateTime.Now - _lastBalloonAt).TotalSeconds >= 20)
-                    {
-                        _lastBalloonAt = DateTime.Now;
-                        _icon.ShowBalloonTip(4000, "拦住了客户端一次抢前台",
-                            string.Format("「{0}」想抢前台，被压回去了（多半是匹配成功或对局开始）。点任务栏或 Alt+Tab 切过去看。",
-                                _guard.LastClientBlockTitle),
-                            ToolTipIcon.Info);
-                    }
-                }
             }
             catch
             {

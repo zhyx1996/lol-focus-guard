@@ -37,6 +37,15 @@ public class R1 {
     try { return System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; } catch { return "?"; }
   }
   [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool fAltTab);
+  [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+  [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO li);
+  [DllImport("kernel32.dll")] public static extern uint GetTickCount();
+  /// <summary>距离最后一次系统输入过了多少毫秒（和守卫用的是同一个系统事实）。</summary>
+  public static uint InputAgeMs() {
+    LASTINPUTINFO li = new LASTINPUTINFO(); li.cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(LASTINPUTINFO));
+    GetLastInputInfo(ref li);
+    return GetTickCount() - li.dwTime;
+  }
   /// <summary>模拟客户端自己抬前台：借前台线程的权限，否则后台进程的 SetForegroundWindow 会被系统拒绝。</summary>
   public static bool RaiseAsClient(IntPtr h) {
     uint p1, p2;
@@ -113,8 +122,37 @@ for ($i = 0; $i -lt 3; $i++) {
 "打回前前台 = $([R1]::FgProc())"
 
 # 让它"像客户端那样"自己抬前台（借前台线程权限，否则后台进程抬不动，测试会一直不触发）
-$raised = [R1]::RaiseAsClient($ptH)
-"抬前台返回 = $raised，现在前台 = $([R1]::FgProc())"
+$idle = $false
+for ($i = 0; $i -lt 40; $i++) {
+    if ([R1]::InputAgeMs() -ge 1500) { $idle = $true; break }
+    Start-Sleep -Milliseconds 300
+}
+if (-not $idle) {
+    Stop-Process -Id $guard.Id -Force -ErrorAction SilentlyContinue
+    Stop-Process -Id $pt.Id -Force -ErrorAction SilentlyContinue
+    Stop-Process -Id $bg.Id -Force -ErrorAction SilentlyContinue
+    "跳过：你一直在操作这台机器（没有连续 1.5 秒的空闲），模拟不了「无输入的强制抢前台」"
+    "`n结果: SKIP"
+    exit 0
+}
+"机器空闲了（最后输入 $([R1]::InputAgeMs())ms 前），开始模拟抢前台"
+
+$raised = $false
+for ($i = 0; $i -lt 3; $i++) {
+    [void][R1]::RaiseAsClient($ptH)
+    Start-Sleep -Milliseconds 400
+    if ([R1]::FgProc() -eq 'PopTarget') { $raised = $true; break }
+}
+"抬前台结果 = $raised，现在前台 = $([R1]::FgProc())"
+if (-not $raised) {
+    # 机器上有人正在操作时，系统会拒绝后台进程抢前台 —— 这不是守卫的问题，跳过而不是误报失败
+    Stop-Process -Id $guard.Id -Force -ErrorAction SilentlyContinue
+    Stop-Process -Id $pt.Id -Force -ErrorAction SilentlyContinue
+    Stop-Process -Id $bg.Id -Force -ErrorAction SilentlyContinue
+    "跳过：测试窗口没能抬到前台（当前有别的程序占着前台，系统拒绝后台抢占），不算失败"
+    "`n结果: SKIP"
+    exit 0
+}
 Start-Sleep -Seconds 3
 
 $text = if (Test-Path $guardLog) { Get-Content $guardLog -Raw } else { '' }

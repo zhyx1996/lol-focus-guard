@@ -1,5 +1,8 @@
 // 规则表的穷举测试：不起任何窗口、不注入任何输入，直接喂"事实"给 FocusRules.Decide，
 // 检查每条规则在每种组合下给出的是放行还是拦截。改规则前后跑一遍，防止把"你手动切窗口"改成"拦"。
+//
+// 核心事实：判"是不是你点的"不看"最近有没有输入"（鼠标随手一动就算输入，太粗），
+// 而是看「鼠标物理按键有没有真的按下」+「按下那一刻指针落在谁身上」。
 using System;
 using LolFocusGuard;
 
@@ -43,12 +46,12 @@ internal static class LogicTest
         else { _fail++; Console.WriteLine(string.Format("  FAIL {0}：期望 {1}，实际 {2}", name, expect, actual)); }
     }
 
-    /// <summary>基线：客户端自己跳前台、没有任何输入。</summary>
+    /// <summary>基线：客户端自己跳前台、没有任何按键按下。</summary>
     private static DecisionFacts Idle()
     {
         DecisionFacts f = new DecisionFacts();
-        f.InputAgeMs = 9000;
-        f.ModifierIdleMs = 60000;
+        f.ClickAgeMs = 9000;      // 很久没按鼠标
+        f.ModifierIdleMs = 60000; // 很久没按 Alt/Win
         return f;
     }
 
@@ -56,34 +59,38 @@ internal static class LogicTest
     {
         Console.WriteLine("=== 规则表 ===");
 
-        // ---- 拦截：它自己弹的 ----
-        Case("没有任何输入，客户端自己跳前台 → 拦截", Idle(), false, DecisionCode.BlockNoInput);
+        // ---- 拦截：它自己弹的（没有任何按键按下） ----
+        Case("没有任何按键按下，客户端自己跳前台 → 拦截", Idle(), false, DecisionCode.BlockNoClick);
 
         DecisionFacts f = Idle();
-        f.InputAgeMs = 200;      // 500ms 内有输入
-        f.InputOnTarget = false;
-        f.InputOnShell = false;
-        Case("有输入但落在别的程序上（你在打游戏）→ 拦截", f, false, DecisionCode.BlockInputElsewhere);
+        f.ClickAgeMs = 200;       // 你刚按了鼠标，但按在别处
+        f.ClickOnTarget = false;
+        f.ClickOnShell = false;
+        Case("按键按在别的程序上（你在打游戏/点别处）→ 拦截", f, false, DecisionCode.BlockClickElsewhere);
 
         f = Idle();
-        f.InputAgeMs = 501;      // 刚好超过宽限
-        Case("输入已经过了 501ms → 拦截（宽限窗口外）", f, false, DecisionCode.BlockNoInput);
+        f.ClickAgeMs = 351;       // 刚好超过 350ms 宽限
+        Case("按键按下已经过了 351ms → 拦截（宽限窗口外）", f, false, DecisionCode.BlockNoClick);
 
         // ---- 放行：你自己切的 ----
         f = Idle();
-        f.InputAgeMs = 300;
-        f.InputOnTarget = true;
-        Case("有输入且点在客户端窗口上 → 放行", f, true, DecisionCode.AllowClickedTarget);
+        f.ClickAgeMs = 300;
+        f.ClickOnTarget = true;
+        Case("按键按下且指针在客户端窗口上 → 放行（你点的）", f, true, DecisionCode.AllowClickedTarget);
 
         f = Idle();
-        f.InputAgeMs = 300;
-        f.InputOnShell = true;
-        Case("有输入且点在任务栏上 → 放行", f, true, DecisionCode.AllowClickedShell);
+        f.ClickAgeMs = 300;
+        f.ClickOnShell = true;
+        Case("按键按下且指针在任务栏上 → 放行（你点的任务栏按钮）", f, true, DecisionCode.AllowClickedShell);
 
         f = Idle();
-        f.InputAgeMs = 9000;
-        f.ModifierIdleMs = 300;  // 刚按过 Alt
-        Case("刚按过 Alt/Win → 放行（哪怕没有别的输入）", f, true, DecisionCode.AllowModifier);
+        f.ClickAgeMs = 350;       // 边界：正好 350ms 还算数
+        f.ClickOnTarget = true;
+        Case("按键按下正好 350ms 前 → 放行（边界）", f, true, DecisionCode.AllowClickedTarget);
+
+        f = Idle();
+        f.ModifierIdleMs = 300;   // 刚按过 Alt
+        Case("刚按过 Alt/Win → 放行（哪怕没按鼠标）", f, true, DecisionCode.AllowModifier);
 
         f = Idle();
         f.ModifierIdleMs = 1500;
@@ -91,7 +98,7 @@ internal static class LogicTest
 
         f = Idle();
         f.ModifierIdleMs = 1501;
-        Case("Alt/Win 过了 1501ms → 不算数", f, false, DecisionCode.BlockNoInput);
+        Case("Alt/Win 过了 1501ms → 不算数", f, false, DecisionCode.BlockNoClick);
 
         f = Idle();
         f.PrevWindowGone = true;
@@ -108,9 +115,9 @@ internal static class LogicTest
 
         f = Idle();
         f.WeGameLoginPhase = true;
-        f.InputAgeMs = 100;
-        f.InputOnTarget = true;
-        Case("WeGame 登录放行优先于输入判据 → 仍放行", f, true, DecisionCode.AllowWeGameLogin);
+        f.ClickAgeMs = 100;
+        f.ClickOnTarget = true;
+        Case("WeGame 登录放行优先于点击判据 → 仍放行", f, true, DecisionCode.AllowWeGameLogin);
 
         // ---- 放行：防拉锯 ----
         f = Idle();
@@ -126,37 +133,36 @@ internal static class LogicTest
 
         f = Idle();
         f.RecentlyAllowed = true;
-        f.InputAgeMs = 100;
-        f.InputOnTarget = false;
-        Case("刚放行过（800ms 内）优先于「输入落在别处」→ 仍放行", f, true, DecisionCode.AllowJustAllowed);
+        f.ClickAgeMs = 100;
+        f.ClickOnTarget = false;
+        Case("刚放行过（800ms 内）优先于「按在别处」→ 仍放行", f, true, DecisionCode.AllowJustAllowed);
 
         f = Idle();
         f.RecentlyAllowed = true;
-        f.Suppressed = false;
         f.TestModeOnly = true;
         Case("测试模式优先于「刚放行过」→ 还是拦", f, false, DecisionCode.BlockTestMode);
 
         // ---- 测试模式 ----
         f = Idle();
         f.TestModeOnly = true;
-        f.InputAgeMs = 50;
-        f.InputOnTarget = true;
+        f.ClickAgeMs = 50;
+        f.ClickOnTarget = true;
         Case("--no-click-allow 测试模式 → 哪怕你真点了也拦", f, false, DecisionCode.BlockTestMode);
 
         // ---- 组合：真实场景拼一起 ----
         f = Idle();
         f.WeGameLoginPhase = false;   // 客户端已经在跑
-        f.InputAgeMs = 8000;          // 你正在看别的窗口
-        Case("客户端在跑，WeGame 卡片自弹、你没在操作 → 拦截", f, false, DecisionCode.BlockNoInput);
+        f.ClickAgeMs = 8000;          // 你正在看别的窗口
+        Case("客户端在跑，WeGame 卡片自弹、你没在操作 → 拦截", f, false, DecisionCode.BlockNoClick);
 
         f = Idle();
-        f.InputAgeMs = 250;
-        f.InputOnShell = true;
+        f.ClickAgeMs = 250;
+        f.ClickOnShell = true;
         Case("客户端在跑，你点了任务栏想切回客户端 → 放行", f, true, DecisionCode.AllowClickedShell);
 
         f = Idle();
-        f.InputAgeMs = 250;
-        f.InputOnTarget = true;
+        f.ClickAgeMs = 250;
+        f.ClickOnTarget = true;
         f.FirstClientWindow = false;
         Case("客户端在跑，你自己点客户端窗口 → 放行", f, true, DecisionCode.AllowClickedTarget);
 
@@ -164,7 +170,7 @@ internal static class LogicTest
         Class("wegame.exe 的窗口 → WeGame", "wegame", "WeGame", "TWINCONTROL", true);
         Class("wegame_env.exe 的窗口 → WeGame", "wegame_env", "", "TWINCONTROL", true);
         Class("browser.exe 标题 WeGame（CEF 那条腿）→ WeGame", "browser", "WeGame", "CefTopWindow", true);
-        Class("browser.exe 标题 WeGame 商店（标题含前缀）→ WeGame", "browser", "WeGame 商城", "CefTopWindow", true);
+        Class("browser.exe 标题 WeGame 商店 → WeGame", "browser", "WeGame 商城", "CefTopWindow", true);
         Class("pallas.exe（内嵌网页宿主）→ WeGame", "pallas", "SIDE_WEB_VIEW", "TWINCONTROL", true);
         Class("QQ 的 browser.exe（QBCoreAx、无标题）→ 不是 WeGame", "browser", "", "QBCoreAx", false);
         Class("客户端窗口 → 不是 WeGame", "LeagueClientUx", "League of Legends", "RCLIENT", false);
@@ -174,6 +180,7 @@ internal static class LogicTest
         Client("LeagueClientUx → 客户端", "LeagueClientUx", true);
         Client("RiotClientServices → 客户端", "RiotClientServices", true);
         Client("wegame → 不是客户端", "wegame", false);
+
         Console.WriteLine();
         Console.WriteLine(string.Format("结果: {0}，通过 {1}，失败 {2}", _fail == 0 ? "PASS" : "FAIL", _pass, _fail));
         Environment.ExitCode = _fail == 0 ? 0 : 1;

@@ -25,14 +25,14 @@ namespace LolFocusGuard
         /// <summary>上一次按 Alt/Win 距今多少毫秒。</summary>
         public double ModifierIdleMs = double.MaxValue;
 
-        /// <summary>系统层面最后一次输入距今多少毫秒（GetLastInputInfo）。</summary>
-        public int InputAgeMs = int.MaxValue;
+        /// <summary>最近一次「鼠标物理按键按下」距今多少毫秒。没按过就是 MaxValue。</summary>
+        public double ClickAgeMs = double.MaxValue;
 
-        /// <summary>输入那一刻，指针压在谁身上 —— 是监控名单里的进程。</summary>
-        public bool InputOnTarget;
+        /// <summary>按下的那一刻，指针压在谁身上 —— 是监控名单里的进程（=你点了它）。</summary>
+        public bool ClickOnTarget;
 
-        /// <summary>输入那一刻，指针压在任务栏 / 开始菜单 / 桌面上。</summary>
-        public bool InputOnShell;
+        /// <summary>按下的那一刻，指针压在任务栏 / 开始菜单 / 桌面上（=你点了任务栏按钮）。</summary>
+        public bool ClickOnShell;
 
         /// <summary>上一个前台窗口已经不在了（刚关闭/退出）。</summary>
         public bool PrevWindowGone;
@@ -49,8 +49,8 @@ namespace LolFocusGuard
         AllowPrevWindowGone,
         AllowClickedTarget,
         AllowClickedShell,
-        BlockNoInput,
-        BlockInputElsewhere,
+        BlockNoClick,
+        BlockClickElsewhere,
         BlockTestMode
     }
 
@@ -69,7 +69,7 @@ namespace LolFocusGuard
     internal static class FocusRules
     {
         public const int ModifierGraceMs = 1500;
-        public const int InputGraceMs = 500;
+        public const int ClickGraceMs = 350;   // 按键按下后多久内算"这次切换是你点的"
 
         /// <summary>
         /// 判定顺序就是优先级，改顺序 = 改行为，测试里有对应用例。
@@ -98,17 +98,18 @@ namespace LolFocusGuard
             // 5) 上一个前台窗口已经没了：前台自然接管，不算它抢
             if (f.PrevWindowGone) return new Decision(true, DecisionCode.AllowPrevWindowGone);
 
-            // 6) 一直没有输入 → 它自己弹的
-            if (f.InputAgeMs > InputGraceMs) return new Decision(false, DecisionCode.BlockNoInput);
+            // 6) 最近这段时间里根本没有「按键按下」→ 它自己弹的
+            //    （只看"有没有输入"是不够的：鼠标随手一动也算输入，会把自发弹窗误判成你点的）
+            if (f.ClickAgeMs > ClickGraceMs) return new Decision(false, DecisionCode.BlockNoClick);
 
-            // 7) 有输入：输入落在被切到前台的这个窗口上 → 你点的
-            if (f.InputOnTarget) return new Decision(true, DecisionCode.AllowClickedTarget);
+            // 7) 按键按下的那一刻指针就在被切到前台的窗口上 → 你点的
+            if (f.ClickOnTarget) return new Decision(true, DecisionCode.AllowClickedTarget);
 
-            // 8) 有输入：输入落在任务栏/开始菜单上 → 你点的
-            if (f.InputOnShell) return new Decision(true, DecisionCode.AllowClickedShell);
+            // 8) 按在任务栏/开始菜单上（点任务栏按钮、缩略图、通知）→ 你点的
+            if (f.ClickOnShell) return new Decision(true, DecisionCode.AllowClickedShell);
 
-            // 9) 有输入，但落在别的程序上（你在打游戏/打字） → 它自己弹的
-            return new Decision(false, DecisionCode.BlockInputElsewhere);
+            // 9) 按在别的程序上（你在打游戏/打字/点别处） → 它自己弹的
+            return new Decision(false, DecisionCode.BlockClickElsewhere);
         }
     }
 
