@@ -181,12 +181,19 @@ D:\WeGameApps\英雄联盟\LeagueClient
 ## 已知局限
 
 - **会有一次极短的闪现（≈9ms）**，做不到完全不出现，原因见上。
-- 如果你**主动**点客户端却被拦了（点击没被识别成"你点的"），再点一次即可；
+- 如果你**主动**点客户端却被拦了（点击没被识别成"你点的"），再点一次即可，
   或者 `Ctrl+Alt+F9` 暂停。
 - WeGame 的登录窗口和"游戏进程已启动"卡片同属 `wegame.exe`，
   目前靠"客户端进程起没起来"区分（登录阶段全放行）。极端时序下（卡片先弹、客户端后起）
   卡片可能被放行一次。
 - EXCLUSIVE 全屏游戏下的观感需要在真打一局时确认。
+- **英雄联盟的窗口会挡掉别的进程的 `ShowWindow`**：实测它的登录窗口
+  （`Client.exe` / `TWINCONTROL`）`ShowWindow(SW_MINIMIZE)` 直接返回 `False`、窗口纹丝不动，
+  `SetWindowPos` 也一样；但它认 `WM_SYSCOMMAND / SC_MINIMIZE`——`PostMessage` 过去立刻最小化。
+  拦下的动作里已经加了这条兜底（先 `ShowWindow`，验 `IsIconic` 没成功就换消息），
+  日志里会写「ShowWindow 被挡，改用 WM_SYSCOMMAND/SC_MINIMIZE 最小化成功」。
+- 没有可以交还的窗口时（比如上一个前台窗口本身也在监控名单里），光"不还焦点"等于没动作，
+  所以这种情况直接最小化，由系统自己挑下一个前台窗口。
 
 ## 测试
 

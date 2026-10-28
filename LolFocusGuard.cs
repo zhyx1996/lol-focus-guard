@@ -119,10 +119,15 @@ namespace LolFocusGuard
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
+        [DllImport("user32.dll")]
+        public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
         public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
         public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
         public const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
         public const int SW_MINIMIZE = 6;
+        public const uint WM_SYSCOMMAND = 0x0112;
+        public const int SC_MINIMIZE = 0xF020;
         public const uint GW_OWNER = 4;
         public const uint GA_ROOT = 2;
         public const int VK_MENU = 0x12;
@@ -1202,10 +1207,28 @@ namespace LolFocusGuard
             {
                 try
                 {
-                    if (wasMinimized)
+                    // 没有可以交还的窗口时（比如上一个前台窗口本身也在监控名单里），
+                    // 光"不还焦点"等于什么都没做，那就直接把它最小化掉，让系统自己挑下一个窗口。
+                    if (wasMinimized || restore == IntPtr.Zero)
                     {
                         Native.ShowWindow(hwnd, SW_MINIMIZE);
                         System.Threading.Thread.Sleep(5);
+
+                        // 实测：英雄联盟的窗口（登录程序那块 TWINCONTROL）会挡掉别的进程的
+                        // ShowWindow —— 调用返回 False、窗口纹丝不动，但它认
+                        // WM_SYSCOMMAND/SC_MINIMIZE：PostMessage 过去立刻最小化。
+                        // 所以这里必须验一下"真的最小化了吗"，没有就换条路。
+                        if (!Native.IsIconic(hwnd))
+                        {
+                            Native.PostMessage(hwnd, Native.WM_SYSCOMMAND, (IntPtr)Native.SC_MINIMIZE, IntPtr.Zero);
+                            System.Threading.Thread.Sleep(15);
+                            if (_verbose)
+                            {
+                                Log(Native.IsIconic(hwnd)
+                                    ? "ShowWindow 被挡，改用 WM_SYSCOMMAND/SC_MINIMIZE 最小化成功"
+                                    : "最小化失败（ShowWindow 和 WM_SYSCOMMAND 都没生效），只交还前台");
+                            }
+                        }
                     }
                     // 最小化后系统一般会把前台交给下一个窗口；没交就自己交还
                     if (Native.GetForegroundWindow() == hwnd && restore != IntPtr.Zero)
