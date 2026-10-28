@@ -265,6 +265,8 @@ namespace LolFocusGuard
         private int _inputCount;
         private volatile int _inputAgeMs = int.MaxValue; // 最后一次输入距今（系统级，不信钩子）
         // 防拉锯：同一窗口 10 秒内被拦太多次就放弃拦截 60 秒
+        private volatile int _clientBlockSeq;
+        private volatile string _lastClientBlockTitle = "";
         private IntPtr _streakHwnd = IntPtr.Zero;
         private int _streakCount;
         private DateTime _streakAt = DateTime.MinValue;
@@ -343,6 +345,13 @@ namespace LolFocusGuard
         public bool Paused { get { return _paused; } }
         public DateTime ResumeAt { get { return _resumeAt; } }
         public string LogPath { get { return _logPath; } }
+
+        /// <summary>拦下"客户端自己抢前台"的次数（只算客户端进程，不算 WeGame）。托盘用它弹提示。</summary>
+        public int ClientBlockSeq { get { return _clientBlockSeq; } }
+
+        /// <summary>最近一次被拦下的客户端窗口标题。</summary>
+        public string LastClientBlockTitle { get { return _lastClientBlockTitle; } }
+
 
         /// <summary>暂停一段时间（到点自动恢复）。</summary>
         public void Pause(TimeSpan duration)
@@ -1180,6 +1189,14 @@ namespace LolFocusGuard
                 escalating ? "，连续弹" : "", cls, title, size,
                 latency >= 0 ? latency.ToString() : "?"));
 
+            // 客户端自己抢前台（多半是"匹配成功/对局已开始"）：记一笔，托盘据此弹提示，
+            // 免得你完全不知道排到人了。
+            if (IsClientProcess(proc))
+            {
+                _lastClientBlockTitle = title;
+                _clientBlockSeq++;
+            }
+
             QueueAction(delegate
             {
                 try
@@ -1425,6 +1442,9 @@ namespace LolFocusGuard
         private readonly ToolStripMenuItem _countItem;
         private readonly HotkeyWindow _hotkeyWindow;
         private readonly System.Windows.Forms.Timer _uiTimer;
+        private int _notifiedSeq;
+        private bool _balloonEnabled = true;
+        private DateTime _lastBalloonAt = DateTime.MinValue;
 
         public TrayApp(Guard guard)
         {
@@ -1442,6 +1462,12 @@ namespace LolFocusGuard
             pause30.Click += delegate { _guard.Pause(TimeSpan.FromMinutes(30)); UpdateUi(); };
             ToolStripMenuItem resume = new ToolStripMenuItem("恢复运行");
             resume.Click += delegate { _guard.Resume(); UpdateUi(); };
+            ToolStripMenuItem balloonItem = new ToolStripMenuItem("气泡提示: 开");
+            balloonItem.Click += delegate
+            {
+                _balloonEnabled = !_balloonEnabled;
+                balloonItem.Text = _balloonEnabled ? "气泡提示: 开" : "气泡提示: 关";
+            };
             ToolStripMenuItem openLog = new ToolStripMenuItem("打开日志");
             openLog.Click += delegate
             {
@@ -1457,6 +1483,8 @@ namespace LolFocusGuard
             _menu.Items.Add(pause5);
             _menu.Items.Add(pause30);
             _menu.Items.Add(resume);
+            _menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(balloonItem);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(openLog);
             _menu.Items.Add(exit);
@@ -1509,6 +1537,22 @@ namespace LolFocusGuard
                     _icon.Text = "LOL 焦点守卫：运行中";
                 }
                 _countItem.Text = string.Format("已拦截: {0} 次", _guard.BlockCount);
+
+                // 客户端自己抢前台被拦了（多半是"匹配成功"）：弹个托盘提示，
+                // 免得你以为没排到人。20 秒最多弹一次，别刷屏。
+                int seq = _guard.ClientBlockSeq;
+                if (seq != _notifiedSeq)
+                {
+                    _notifiedSeq = seq;
+                    if (_balloonEnabled && (DateTime.Now - _lastBalloonAt).TotalSeconds >= 20)
+                    {
+                        _lastBalloonAt = DateTime.Now;
+                        _icon.ShowBalloonTip(4000, "拦住了客户端一次抢前台",
+                            string.Format("「{0}」想抢前台，被压回去了（多半是匹配成功或对局开始）。点任务栏或 Alt+Tab 切过去看。",
+                                _guard.LastClientBlockTitle),
+                            ToolTipIcon.Info);
+                    }
+                }
             }
             catch
             {
