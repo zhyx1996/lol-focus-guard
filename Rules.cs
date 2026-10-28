@@ -64,7 +64,7 @@ namespace LolFocusGuard
 
     internal static class FocusRules
     {
-        public const double ModifierGraceMs = 1500;
+        public const int ModifierGraceMs = 1500;
         public const int InputGraceMs = 500;
 
         /// <summary>

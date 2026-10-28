@@ -255,7 +255,8 @@ namespace LolFocusGuard
         private readonly HashSet<IntPtr> _knownWindows = new HashSet<IntPtr>();
 
         // ---- 低级输入钩子：区分"你自己切过去的"和"进程强制抢前台" ----
-        private const int INPUT_GRACE_MS = 500; // 最后一次输入后多久内算"用户操作引起"
+        // 判定用的两个时间窗口只有一份定义（在 Rules.cs），这里只是别名，避免两边改漏一边
+        private const int INPUT_GRACE_MS = FocusRules.InputGraceMs; // 最后一次输入后多久内算"用户操作引起"
         private IntPtr _mouseHook = IntPtr.Zero;
         private IntPtr _kbdHook = IntPtr.Zero;
         private Native.LowLevelHookProc _mouseProc;
@@ -273,7 +274,7 @@ namespace LolFocusGuard
         private readonly Dictionary<IntPtr, DateTime> _suppressedUntil = new Dictionary<IntPtr, DateTime>();
         // Alt / Win 最后一次按下的时间：这两个键才是"切窗口"用的
         private DateTime _lastModifierAt = DateTime.MinValue;
-        private const int MODIFIER_GRACE_MS = 1500;
+        private const int MODIFIER_GRACE_MS = FocusRules.ModifierGraceMs;
 
         public Guard(IEnumerable<string> targets, string logPath, bool verbose, bool noClickAllow,
             string lcuDir)
