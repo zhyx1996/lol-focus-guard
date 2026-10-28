@@ -1263,13 +1263,25 @@ namespace LolFocusGuard
                         }
                     }
                     // 最小化后系统一般会把前台交给下一个窗口；没交就自己交还
-                    if (Native.GetForegroundWindow() == hwnd && restore != IntPtr.Zero)
+                    IntPtr fgNow = Native.GetForegroundWindow();
+                    if (_verbose && (fgNow == hwnd || restore == IntPtr.Zero))
+                    {
+                        Log(string.Format("打回细节: 前台还是目标={0}，交还目标={1}（{2}）",
+                            fgNow == hwnd, restore == IntPtr.Zero ? "空" : ProcNameOf(restore),
+                            restore == IntPtr.Zero ? "没有可交还的窗口，只最小化" : "有窗口可交还"));
+                    }
+                    if (fgNow == hwnd && restore != IntPtr.Zero)
                     {
                         ForceForeground(restore);
                         System.Threading.Thread.Sleep(10);
                         if (Native.GetForegroundWindow() == hwnd)
                         {
                             Native.SwitchToThisWindow(restore, false); // 最后的兜底
+                            System.Threading.Thread.Sleep(10);
+                        }
+                        if (_verbose && Native.GetForegroundWindow() == hwnd)
+                        {
+                            Log("打回失败: 前台没能交还（目标窗口还占着前台）");
                         }
                     }
                 }
