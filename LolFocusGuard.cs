@@ -1927,13 +1927,15 @@ namespace LolFocusGuard
                     // 为什么记：全屏独占游戏（真全屏、不是无边框）里 SetForegroundWindow 可能被系统拒绝，
                     // 结果是客户端被最小化了、但前台落到了桌面/别的程序上，游戏收不到键盘 —— 
                     // 观感是"我游戏突然不动了，得点一下鼠标"。这条日志就是用来抓这个场景的。
-                    if (_verbose && restore != IntPtr.Zero && Native.IsWindow(restore))
+                    // 注意排除"预期窗口本身已经是最小化"的情况：那种时候系统本来就该把前台交给
+                    // Z 序里的下一个窗口，前台不等于 restore 是正常现象，不是异常。
+                    if (_verbose && restore != IntPtr.Zero && Native.IsWindow(restore) && !Native.IsIconic(restore))
                     {
                         IntPtr fgAfter = Native.GetForegroundWindow();
                         if (fgAfter != restore && fgAfter != hwnd)
                         {
                             Log(string.Format("诊断：打回后前台没有回到预期窗口（预期 {0}，实际 {1}）——" +
-                                "全屏独占游戏里可能需要手动点一下",
+                                "若当时是全屏独占游戏，可能表现为要手动点一下才恢复；否则多半只是焦点落到别的窗口，无害",
                                 ProcNameOfCached(restore),
                                 fgAfter == IntPtr.Zero ? "无" : ProcNameOfCached(fgAfter)));
                         }

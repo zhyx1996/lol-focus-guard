@@ -44,7 +44,18 @@ $allowReasons = @{}
 $giveUp = 0
 $cancel = 0
 $cancelReasons = @{}
-$blockFail = 0
+# 打回动作的三种结果（措辞以 LolFocusGuard.cs 为准；匹配只认关键词，容忍后半句改动）：
+#   「最小化失败（ShowWindow 和 WM_SYSCOMMAND 都没生效）」→ 真没压下去
+#   「ShowWindow 被挡，改用 WM_SYSCOMMAND/SC_MINIMIZE 最小化成功」→ 兜底生效，是**成功**
+#   「打回失败: 前台没能交还」→ 最小化了，但焦点没还给你（全屏独占挡 SetForegroundWindow）
+$minFail = 0
+$fallbackMin = 0
+$handoffFail = 0
+# 两条动作副作用诊断（守卫里只在 --verbose 下写）
+$diagModal = 0; $diagModalLines = @()      # 打回时窗口正挂着模态弹窗（IsWindowEnabled=False）
+$diagFgNotRestored = 0; $diagFgLines = @() # 打回后前台没回到预期窗口
+$diagOther = 0; $diagOtherLines = @()      # 认不出来的诊断行（守卫改措辞后就落这里，不静默丢）
+$autoOther = 0; $autoOtherLines = @()      # 含「打回」但三档都没认出来的行
 $clientStarts = 0
 $clientStops = 0
 $sessionBlocks = @()
@@ -52,7 +63,13 @@ $heartbeats = 0
 $unlockAllows = 0
 $wegameLoginAllows = 0
 $switchEvents = 0
-# 「刚点开又被压回去」的复发：放行某个窗口之后 1.2 秒内，同一个窗口又被拦截
+# 只有"你在操作"的放行才参与复发配对。抑制期（正在放弃拦截期）、刚放行过这个窗口、刚解锁
+# 这些不是用户意图：拿它们配对必然误报 —— 抑制期一结束它再弹就被拦，间隔往往 <1.2 秒，
+# 结果被算成"你刚把它叫出来又被压回去"，而用户根本没叫过它。
+$userIntentPattern = '你点了|你按了 Win|切换器|Alt|客户端窗口第一次出现|WeGame 登录阶段'
+# 「用户操作后又被压回去」的复发：用户意图放行之后 1.2 秒内，同一进程的窗口又被拦截。
+# 注意：同一 hwnd 在用户放行后 3 秒内不可能被再拦（守卫有 SameWindowJustAllowed 保护），
+# 所以这条命中只可能是"同进程的另一个窗口"或"抑制期尾巴"，只作提示（!），不当必失败。
 $relapse = 0
 $relapseSamples = @()
 # 同一个窗口 10 秒内被拦 >= 5 次（拉锯）
@@ -73,8 +90,10 @@ foreach ($raw in $all) {
         try { $tsNow = [datetime]::ParseExact($t, 'yyyy-MM-dd HH:mm:ss.fff', $null) } catch { $tsNow = $null }
     }
 
-    if ($line -match '前台变化 → ([^\s(]+)') { $lastFgProc = $Matches[1]; $fgChangeLines++; continue }
-    if ($line -match '拦截 #\d+：([^\s(]+)') {
+    # 进程名可能带空格/中文：截断点放在 (pid= 上，不能按空白切（否则带空格的名字会被截成第一个词，
+    # 第二遍「漏网目标」的正则会整行不匹配、连 $prevProc 都不更新）
+    if ($line -match '前台变化 → (.+?) \(pid=') { $lastFgProc = $Matches[1]; $fgChangeLines++; continue }
+    if ($line -match '拦截 #\d+：(.+?) \(pid=') {
         $w = $Matches[1]
         if ($blockByWindow.ContainsKey($w)) { $blockByWindow[$w]++ } else { $blockByWindow[$w] = 1 }
         # 复发检测：刚放行过这个窗口，1.2 秒内又被压回去 = 用户最痛的那个症状
@@ -103,8 +122,11 @@ foreach ($raw in $all) {
         # 记下"这次放的是谁"：放行行本身不带进程名，靠上一行「前台变化 → <proc>」配对
         # （普通日志没有「前台变化」行，所以复发检测只在 --verbose 日志上有效）
         if ($null -ne $tsNow -and $lastFgProc -ne '') {
-            $lastAllowAt = $tsNow
-            $lastAllowProc = $lastFgProc
+            # 只有用户意图的放行才记账；抑制期/刚放行过/刚解锁这类不参与（否则必然误报）
+            if ($r -match $userIntentPattern) {
+                $lastAllowAt = $tsNow
+                $lastAllowProc = $lastFgProc
+            }
             # 配对用掉就清掉：一行放行只能对上它前面那一次前台变化，
             # 否则后面另一个窗口的放行会错误地沿用旧进程名，把"复发"算错。
             $lastFgProc = ''
@@ -121,7 +143,33 @@ foreach ($raw in $all) {
         if ($cancelReasons.ContainsKey($why)) { $cancelReasons[$why]++ } else { $cancelReasons[$why] = 1 }
         continue
     }
-    if ($line -match '打回失败|ShowWindow 被挡|压不下去') { $blockFail++; continue }
+    # 两条"动作副作用"诊断（守卫 8577447 / 7db4966，只 --verbose 写）。
+    # 放在「打回」系列判断之前：这两行的正文里含「打回」字样，先吃掉免得被归错档。
+    # 只认 "[时间戳] 诊断：" 这个前缀 + 关键字，认不出来的进"其他诊断"档 —— 守卫以后改措辞也不会
+    # 让诊断行悄悄消失（宁可多一栏，不能一条都不显示）。
+    if ($line -match '\] 诊断：') {
+        if ($line -match '不可交互|模态') {
+            $diagModal++
+            if ($diagModalLines.Count -lt 3) { $diagModalLines += ($line -replace '^\[(\d{4}-\d{2}-\d{2}) ', '[') }
+        } elseif ($line -match '预期窗口|预期 ') {
+            $diagFgNotRestored++
+            if ($diagFgLines.Count -lt 3) { $diagFgLines += ($line -replace '^\[(\d{4}-\d{2}-\d{2}) ', '[') }
+        } else {
+            $diagOther++
+            if ($diagOtherLines.Count -lt 3) { $diagOtherLines += ($line -replace '^\[(\d{4}-\d{2}-\d{2}) ', '[') }
+        }
+        continue
+    }
+    # 打回动作的三种结果，分开计（顺序不能换：「最小化失败」那行也含 ShowWindow 字样）
+    if ($line -match '最小化失败') { $minFail++; continue }
+    if ($line -match 'ShowWindow 被挡' -or ($line -match 'SC_MINIMIZE' -and $line -match '最小化成功')) { $fallbackMin++; continue }
+    if ($line -match '打回失败') { $handoffFail++; continue }
+    if ($line -match '打回细节') { continue }   # 已知的可选细节行，不属于任何一档结果
+    if ($line -match '打回') {                  # 措辞变了、上面三档都没认出来 → 单独露面，不要静默丢掉
+        $autoOther++
+        if ($autoOtherLines.Count -lt 3) { $autoOtherLines += ($line -replace '^\[(\d{4}-\d{2}-\d{2}) ', '[') }
+        continue
+    }
     if ($line -match '监测到客户端/WeGame 已启动') { $clientStarts++; continue }
     if ($line -match '客户端/WeGame 已全部退出：本轮拦截 (\d+) 次') { $clientStops++; $sessionBlocks += [int]$Matches[1]; continue }
     if ($line -match '心跳 ') {
@@ -141,7 +189,7 @@ $shellProcs = @('explorer', 'StartMenuExperienceHost', 'ShellExperienceHost', 'S
 $prevProc = ''; $prevTitle = ''
 foreach ($raw in $all) {
     $line = [string]$raw
-    if ($line -notmatch '前台变化 → ([^\s(]+) \(pid=\d+\) class=([^\s]+) 标题="([^"]*)" 尺寸=(\S+) 最小化=(\w+) 按键=(.+)$') { continue }
+    if ($line -notmatch '前台变化 → (.+?) \(pid=\d+\) class=(\S*) 标题="([^"]*)" 尺寸=(\S+) 最小化=(\w+) 按键=(.+)$') { continue }
     $proc = $Matches[1]; $cls = $Matches[2]; $title = $Matches[3]; $size = $Matches[4]; $minimized = $Matches[5]; $keyInfo = $Matches[6]
     $idle = ($keyInfo -match '没按过或已用掉')
     $fromReal = ($prevProc -ne '' -and ($shellProcs -notcontains $prevProc))
@@ -190,7 +238,7 @@ if ($stealers.Count -gt 0) {
     }
 }
 if ($relapse -gt 0) {
-    "刚放行又被压回去（1.2 秒内同窗口再拦）: $relapse 次 —— 这就是『得切好几遍』那个症状"
+    "用户操作后 1.2 秒内同进程的窗口又被拦: $relapse 次（同一窗口 3 秒内不可能被再拦，只可能是同进程另一个窗口或抑制期尾巴）"
     foreach ($rs in $relapseSamples) { "  $rs" }
 }
 if ($burstWindows.Count -gt 0) {
@@ -201,8 +249,30 @@ if ($burstWindows.Count -gt 0) {
 if ($cancel -gt 0) {
     foreach ($k in ($cancelReasons.GetEnumerator() | Sort-Object -Property Value -Descending)) { "  $($k.Key) ×$($k.Value)" }
 }
-"打回失败/被挡: $blockFail 次"
+"最小化失败（ShowWindow 和 SC_MINIMIZE 都没生效，真没压下去）: $minFail 次"
+"ShowWindow 被挡 → 改用 SC_MINIMIZE 成功（兜底生效，不算失败）: $fallbackMin 次"
+"前台没能交还（已最小化，但焦点没回到你原来的窗口）: $handoffFail 次"
+if ($autoOther -gt 0) {
+    "打回相关但认不出类型的行（守卫可能改了措辞，点这条日志）: $autoOther 行"
+    foreach ($l in $autoOtherLines) { "  $l" }
+}
 if ($heartbeats -gt 0) { "心跳行: $heartbeats 行（说明这局是 --verbose 跑的；切换器事件累计=$switchEvents）" }
+if ($diagModal -gt 0 -or $diagFgNotRestored -gt 0 -or $diagOther -gt 0) {
+    ''
+    '--- 动作副作用诊断（--verbose 才记；真机上出现了要当回事）---'
+    if ($diagModal -gt 0) {
+        "打回时窗口正挂着模态弹窗（IsWindowEnabled=False）: $diagModal 次 —— 这种弹窗可能是「接受对局」之类必须点的东西"
+        foreach ($l in $diagModalLines) { "  $l" }
+    }
+    if ($diagFgNotRestored -gt 0) {
+        "打回后前台没回到预期窗口: $diagFgNotRestored 次 —— 若当时是全屏独占游戏，表现为「游戏突然不动，得点一下鼠标」"
+        foreach ($l in $diagFgLines) { "  $l" }
+    }
+    if ($diagOther -gt 0) {
+        "认不出类型的诊断行: $diagOther 行 —— 守卫可能加了新诊断，点这条日志"
+        foreach ($l in $diagOtherLines) { "  $l" }
+    }
+}
 ''
 
 # ---------------- 判定 ----------------
@@ -255,7 +325,7 @@ if ($unblockedStealers.Count -gt 0) {
     '  如果客户端还没起来（WeGame 登录阶段），按设计就是放行。'
 }
 if ($relapse -gt 0) {
-    "✗ 有 $relapse 次『你刚把它叫出来、1.2 秒内又被压回去』 —— 这正是最痛的那个症状，属于必须修：把带这几次时间点的日志发我"
+    "! 有 $relapse 次『你操作完 1.2 秒内同进程的窗口又被拦』：**不是必失败** —— 同一窗口在用户放行后 3 秒内不可能被再拦（SameWindowJustAllowed 保护），所以这里只可能是①同进程的另一个窗口自己弹出来（拦对了）或②放弃拦截期刚结束的尾巴。把这几段时间点发我，我对着日志确认"
 }
 if ($burstWindows.Count -gt 0) {
     "! 有窗口 10 秒内被拦 ≥5 次：它在反复抢、我们反复压（拉锯）。把这段日志发我，看是不是该放弃得更早/换更硬的手段"
@@ -266,11 +336,20 @@ if ($giveUp -gt 0) {
 if ($cancel -gt 0) {
     "! 有 $cancel 次「取消拦截」：如果这些不是你按 Win/点任务栏造成的，就是偶发漏拦，把带原因的那段发我"
 }
-if ($blockFail -gt 0) {
-    "! 有 $blockFail 次「打回失败」：窗口没被最小化掉（可能被系统策略挡住），发我这段日志"
+if ($minFail -gt 0) {
+    "! 有 $minFail 次「最小化失败」：ShowWindow 和 SC_MINIMIZE 都没生效，窗口没被压下去，发我这段日志"
 }
-if ($giveUp -eq 0 -and $cancel -eq 0 -and $blockFail -eq 0 -and $relapse -eq 0 -and $burstWindows.Count -eq 0 -and $totalBlocks -gt 0) {
-    '✓ 没有放弃拦截、没有取消拦截、没有打回失败 —— 拦得干净'
+if ($handoffFail -gt 0) {
+    "! 有 $handoffFail 次「前台没能交还」：窗口已经最小化，但焦点没回到你原来那个窗口（全屏独占挡 SetForegroundWindow 就会这样），发我这段日志"
+}
+if ($fallbackMin -gt 0) {
+    "· 有 $fallbackMin 次走的是兜底路径（ShowWindow 被挡 → SC_MINIMIZE 成功）：这是成功、不是失败，只说明那些窗口在挡 ShowWindow"
+}
+if ($diagModal -gt 0 -or $diagFgNotRestored -gt 0 -or $diagOther -gt 0) {
+    "! 有 $($diagModal + $diagFgNotRestored + $diagOther) 条动作副作用诊断（见上面「动作副作用诊断」段）：这些是我们动作的副作用，不是判定错误，但要看一眼"
+}
+if ($giveUp -eq 0 -and $cancel -eq 0 -and $minFail -eq 0 -and $handoffFail -eq 0 -and $relapse -eq 0 -and $burstWindows.Count -eq 0 -and $totalBlocks -gt 0) {
+    '✓ 没有放弃拦截、没有取消拦截、没有最小化失败、没有前台没交还 —— 拦得干净'
 }
 if (-not $VerboseLog -and $heartbeats -eq 0) {
     ''
