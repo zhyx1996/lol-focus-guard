@@ -323,6 +323,10 @@ namespace LolFocusGuard
         private readonly Dictionary<IntPtr, long> _suppressedFrom = new Dictionary<IntPtr, long>();
         // Alt / Win 最后一次按下的时间：这两个键才是"切窗口"用的
         private long _lastModifierAt = Clock.Never;
+        // 上面那一下按的是 Win 还是 Alt。
+        // 只用来区分"明确的切窗口手势"（Win+数字/Win+方向）和"打游戏时的 Alt"
+        // （LoL 里 Alt+Q/W/E/R 是自施法，按得极频繁 —— 拿它当接管理由就会偶发漏拦）。
+        private volatile bool _lastModifierWasWin;
         // Alt+Tab 切换器状态（EVENT_SYSTEM_SWITCHSTART / SWITCHEND）：慢客户端兜底
         private IntPtr _switchHook = IntPtr.Zero;
         private volatile bool _altTabOpen;
@@ -543,13 +547,19 @@ namespace LolFocusGuard
                     // 并且按下的落点得像个切换动作（shell 的点击入口，或目标进程的窗口）。
                     // "这次拦截之后你有没有按过鼠标/Modifier" 用"谁更近"来判断：
                     // AgeMs 越小越新，所以"点击比拦截更晚"= AgeMs(点击) < AgeMs(拦截)。
+                    //
+                    // 判据和执行前复核（ShouldStillBlock）共用 FocusRules.IsSwitchGesture：
+                    // 两处如果各写一套，早晚会漂移 —— 而且这里的 Alt 也一样不能算接管
+                    // （LoL 里 Alt+Q/W/E/R 是自施法，Alt 一按就取消重试，等于弹窗留在前台）。
                     double blockAge = Clock.AgeMs(_pendingBlockAt);
                     double clickAge = Clock.AgeMs(_lastClickAt);
                     double modifierAge = Clock.AgeMs(_lastModifierAt);
-                    bool userTakingOver =
-                        (clickAge < blockAge && clickAge <= SHELL_CLICK_GRACE_MS &&
-                         (IsShellClickClass(_lastClickClass) || _targets.Contains(_lastClickWhere))) ||
-                        (modifierAge < blockAge);
+                    // "这次拦截之后按的、而且在宽限内"才算数（宽限和判定那一侧同一档）
+                    bool clickRecent = clickAge < blockAge && clickAge <= SHELL_CLICK_GRACE_MS;
+                    bool shellEntry = clickRecent && IsShellProcess(_lastClickWhere) && IsShellClickClass(_lastClickClass);
+                    bool targetWindow = clickRecent && _targets.Contains(_lastClickWhere);
+                    bool winPressed = modifierAge < blockAge && _lastModifierWasWin;
+                    bool userTakingOver = FocusRules.IsSwitchGesture(shellEntry, targetWindow, winPressed);
 
                     if (_paused || Clock.AgeMs(_lastAllowAt) < blockAge || userTakingOver)
                     {
@@ -682,11 +692,14 @@ namespace LolFocusGuard
                 _inputAgeMs = int.MaxValue;
             }
 
-            if ((Native.GetAsyncKeyState(Native.VK_MENU) & 0x8000) != 0 ||
-                (Native.GetAsyncKeyState(Native.VK_LWIN) & 0x8000) != 0 ||
-                (Native.GetAsyncKeyState(Native.VK_RWIN) & 0x8000) != 0)
+            bool altDown = (Native.GetAsyncKeyState(Native.VK_MENU) & 0x8000) != 0;
+            bool winDown = (Native.GetAsyncKeyState(Native.VK_LWIN) & 0x8000) != 0 ||
+                           (Native.GetAsyncKeyState(Native.VK_RWIN) & 0x8000) != 0;
+            if (altDown || winDown)
             {
                 _lastModifierAt = Clock.NowMs();
+                // Win 优先：Alt+Win 同时按着的时候按 Win 算（Win 才是明确的切窗口手势）
+                _lastModifierWasWin = winDown;
             }
         }
         /// <summary>鼠标指针下面那个顶层窗口属于哪个进程。</summary>
@@ -1605,6 +1618,7 @@ namespace LolFocusGuard
                         if (info.vkCode == 0x12 || info.vkCode == 0x5B || info.vkCode == 0x5C) // Alt / Win
                         {
                             _lastModifierAt = Clock.NowMs();
+                            _lastModifierWasWin = (info.vkCode == 0x5B || info.vkCode == 0x5C);
                         }
                     }
                 }
@@ -1706,14 +1720,17 @@ namespace LolFocusGuard
                         System.Threading.Thread.Sleep(LATE_EVIDENCE_WAIT_MS);
                         double lateClickAge = Clock.AgeMs(_lastClickAt);
                         double lateModifierAge = Clock.AgeMs(_lastModifierAt);
-                        // BlockNoClick 的前提就是"判定那一刻点击已经 > 350ms、Alt 已经 > 1500ms"，
+                        // BlockNoClick 的前提就是"判定那一刻点击已经 > 350ms、Alt/Win 已经 > 1500ms"，
                         // 所以这两个值在等完之后仍落在宽限内，只可能是这 30ms 里新到的证据。
-                        if (lateClickAge <= FocusRules.ClickGraceMs ||
-                            lateModifierAge <= FocusRules.ModifierGraceMs)
+                        // Modifier 这条同样只认 Win：Alt 自施法按得太频繁，不能拿它放弃拦截
+                        // （真按了 Alt+Tab 的话，下面 ShouldStillBlock 的"还是不是前台"会把它挡掉）。
+                        bool lateWin = _lastModifierWasWin && lateModifierAge <= FocusRules.ModifierGraceMs;
+                        if (lateClickAge <= FocusRules.ClickGraceMs || lateWin)
                         {
                             CancelBlocked(requestId, hwnd,
-                                string.Format("点击证据晚到（等 {0}ms 后按键={1}，Alt={2}）→ 放弃这次拦截",
-                                    LATE_EVIDENCE_WAIT_MS, DescribeAge(lateClickAge), DescribeAge(lateModifierAge)));
+                                string.Format("点击证据晚到（等 {0}ms 后按键={1}，Win={2}）→ 放弃这次拦截",
+                                    LATE_EVIDENCE_WAIT_MS, DescribeAge(lateClickAge),
+                                    _lastModifierWasWin ? DescribeAge(lateModifierAge) : "没按"));
                             return;
                         }
                     }
@@ -1816,20 +1833,31 @@ namespace LolFocusGuard
                 return false;
             }
 
-            // "入队之后你又按过鼠标 / Alt" = 这中间你已经接管了。
+            // "入队之后你做了个**像切窗口**的动作" = 这中间你已经接管了。
             // AgeMs 越小越新，所以"比这次请求更晚" = AgeMs(证据) < AgeMs(请求时刻)。
+            //
+            // 判据必须认落点、只认 Win（FocusRules.IsSwitchGesture，规则层有穷举用例）：
+            //   · 游戏里右键走位（每秒好几次）、点桌面、点聊天框，都是"按下了鼠标"，
+            //     但不是"你要切窗口" —— 拿它们取消拦截，真机表现就是「偶发漏拦」；
+            //   · LoL 里 Alt+Q/W/E/R 是自施法，Alt 按得极频繁，同理不能当接管证据。
             double reqAge = Clock.AgeMs(requestAt);
             double clickAge = Clock.AgeMs(_lastClickAt);
-            if (clickAge < reqAge)
-            {
-                why = string.Format("排队之后你按了鼠标（{0:0}ms前@{1}）",
-                    clickAge, _lastClickWhere.Length > 0 ? _lastClickWhere : "?");
-                return false;
-            }
+            bool clickNewer = clickAge < reqAge;
+            bool shellEntry = clickNewer && IsShellProcess(_lastClickWhere) && IsShellClickClass(_lastClickClass);
+            bool targetWindow = clickNewer && _targets.Contains(_lastClickWhere);
             double modifierAge = Clock.AgeMs(_lastModifierAt);
-            if (modifierAge < reqAge)
+            bool winPressed = modifierAge < reqAge && _lastModifierWasWin;
+
+            if (FocusRules.IsSwitchGesture(shellEntry, targetWindow, winPressed))
             {
-                why = string.Format("排队之后你按了 Alt/Win（{0:0}ms前）", modifierAge);
+                if (winPressed)
+                    why = string.Format("排队之后你按了 Win（{0}ms前）", modifierAge);
+                else if (shellEntry)
+                    why = string.Format("排队之后你点了任务栏/开始菜单类入口（{0:0}ms前，class={1}）",
+                        clickAge, _lastClickClass.Length > 0 ? _lastClickClass : "?");
+                else
+                    why = string.Format("排队之后你点了被监控的窗口（{0:0}ms前@{1}）",
+                        clickAge, _lastClickWhere.Length > 0 ? _lastClickWhere : "?");
                 return false;
             }
 

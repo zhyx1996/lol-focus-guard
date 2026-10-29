@@ -144,6 +144,32 @@ namespace LolFocusGuard
             // 9) 按在别的程序上（你在打游戏/打字/点别处） → 它自己弹的
             return new Decision(false, DecisionCode.BlockClickElsewhere);
         }
+
+        /// <summary>
+        /// 「这一下是你在切窗口」的判据：点击落点 + Win 键，两条通道二选一。
+        ///
+        /// 用在两处，所以抽成纯函数（判错一次就是漏拦或误拦，值得有穷举用例）：
+        ///   1) 排队的最小化动作**动手前复核**（Guard.ShouldStillBlock）：
+        ///      入队到执行之间这几十毫秒里你的切换手势到了 → 放弃这次打回；
+        ///   2) 「窗口赖在前台」的**重试**判断（Guard 的 userTakingOver）：同一套判据决定别再重试。
+        ///
+        /// **为什么必须认落点**：游戏里右键走位（每秒好几次）、点桌面、点聊天框，
+        /// 都只是"按下了鼠标"，不是"你要切窗口"。不认落点的话，这些点击只要恰好落进
+        /// "入队 → 执行"那几毫秒，就会把一次真正的拦截取消掉 —— 真机表现就是「偶发漏拦」。
+        ///
+        /// **为什么只认 Win 不认 Alt**：LoL 里 Alt+Q/W/E/R 是自施法，Alt 按得极频繁。
+        /// 真正的 Alt+Tab 不需要这条兜：切换器事件（SWITCHSTART/SWITCHEND + 2.5 秒宽限）
+        /// 和 ModifierGraceMs（1.5 秒）早就让那一轮根本走不到"拦"。
+        /// </summary>
+        /// <param name="shellEntry">落点是 shell 的"点击入口"（任务栏/缩略图/托盘溢出/开始菜单/任务视图）</param>
+        /// <param name="targetWindow">落点是被监控进程的窗口（你直接点了客户端）</param>
+        /// <param name="winPressed">刚按下了 Win（Win+数字 / Win+方向 / Win+D…）</param>
+        public static bool IsSwitchGesture(bool shellEntry, bool targetWindow, bool winPressed)
+        {
+            if (winPressed) return true;   // Win+数字：明确的"切到第 N 个窗口"
+            if (shellEntry) return true;   // 任务栏/缩略图/开始菜单：明确的"点它把它叫出来"
+            return targetWindow;           // 直接点了被监控的窗口
+        }
     }
 
     /// <summary>

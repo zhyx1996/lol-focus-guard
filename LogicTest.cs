@@ -40,6 +40,13 @@ internal static class LogicTest
         Report(name, actual == expect, expect ? "是客户端" : "不是客户端", actual ? "是客户端" : "不是客户端");
     }
 
+    /// <summary>"这一下是你在切窗口"的判据（点击落点 + Win 键）：Guard 里两处共用。</summary>
+    private static void Gesture(string name, bool shellEntry, bool targetWindow, bool winPressed, bool expect)
+    {
+        bool actual = FocusRules.IsSwitchGesture(shellEntry, targetWindow, winPressed);
+        Report(name, actual == expect, expect ? "算接管" : "不算接管", actual ? "算接管" : "不算接管");
+    }
+
     private static void Report(string name, bool ok, string expect, string actual)
     {
         if (ok) { _pass++; Console.WriteLine("  ok   " + name); }
@@ -213,6 +220,18 @@ internal static class LogicTest
         f.ClickOnTarget = true;
         f.FirstClientWindow = false;
         Case("客户端在跑，你自己点客户端窗口 → 放行", f, true, DecisionCode.AllowClickedTarget);
+
+        // ---- "这一下是你在切窗口"：执行前复核 / 重试判断共用的判据 ----
+        // 判错的代价：把"游戏里右键走位""点桌面""Alt 自施法"当成接管 → 该拦没拦（偶发漏拦）；
+        // 反过来太严 → 你点任务栏把窗口叫出来了，它又被压回去。
+        Gesture("排队期间点了任务栏/开始菜单（没按 Win）→ 算接管，放弃这次打回",
+                true, false, false, true);
+        Gesture("排队期间点了普通程序窗口（游戏画面/桌面/聊天框）→ 不算接管，照拦",
+                false, false, false, false);
+        Gesture("排队期间直接点了被监控的客户端窗口 → 算接管",
+                false, true, false, true);
+        Gesture("排队期间按了 Win（Win+数字，落点在别处）→ 算接管",
+                false, false, true, true);
 
         // ---- 窗口分类：WeGame 的界面跑在 browser/pallas 里，而 browser.exe 又被 QQ 用着 ----
         Class("wegame.exe 的窗口 → WeGame", "wegame", "WeGame", "TWINCONTROL", true);
