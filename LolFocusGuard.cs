@@ -1922,6 +1922,22 @@ namespace LolFocusGuard
 
                     // 验收这次动作到底有没有把它从前台赶走（见 RecordBlockResult 的注释）。
                     RecordBlockResult(hwnd, requestAt);
+
+                    // 诊断（只 verbose）：压下去之后，前台有没有回到"应该去的那个窗口"。
+                    // 为什么记：全屏独占游戏（真全屏、不是无边框）里 SetForegroundWindow 可能被系统拒绝，
+                    // 结果是客户端被最小化了、但前台落到了桌面/别的程序上，游戏收不到键盘 —— 
+                    // 观感是"我游戏突然不动了，得点一下鼠标"。这条日志就是用来抓这个场景的。
+                    if (_verbose && restore != IntPtr.Zero && Native.IsWindow(restore))
+                    {
+                        IntPtr fgAfter = Native.GetForegroundWindow();
+                        if (fgAfter != restore && fgAfter != hwnd)
+                        {
+                            Log(string.Format("诊断：打回后前台没有回到预期窗口（预期 {0}，实际 {1}）——" +
+                                "全屏独占游戏里可能需要手动点一下",
+                                ProcNameOfCached(restore),
+                                fgAfter == IntPtr.Zero ? "无" : ProcNameOfCached(fgAfter)));
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
