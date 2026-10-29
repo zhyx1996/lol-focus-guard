@@ -2267,8 +2267,18 @@ namespace LolFocusGuard
         /// </summary>
         private void RecordBlockResult(IntPtr hwnd, long requestAt)
         {
-            if (Native.GetForegroundWindow() != hwnd)
+            // 「压不动」= 它既没最小化、又还占着前台。只看前台是不够的：
+            // 全屏游戏当下一个前台窗口时，SetForegroundWindow(游戏) 可能被系统拒绝，
+            // 于是"已经把它最小化了、但前台名义上还挂着它"会被算成失败；
+            // 这种失败攒到 5 次就放弃拦截 15 秒 —— 等于打游戏时正好不设防。
+            // 最小化窗口不画任何像素，你已经能正常看到并操作自己的窗口了，这就算压下去了。
+            bool stillForeground = Native.GetForegroundWindow() == hwnd;
+            if (!stillForeground || Native.IsIconic(hwnd))
             {
+                if (_verbose && stillForeground)
+                {
+                    Log("打回结果: 它已最小化（前台名义上还挂着它，但屏幕没被占）→ 算压下去了");
+                }
                 lock (_sync)
                 {
                     _blockFailHwnd = IntPtr.Zero;
