@@ -1104,21 +1104,37 @@ namespace LolFocusGuard
                 LogDecision(decision, hwnd, where);
                 if (decision.Allow)
                 {
-                    // 记下"刚刚放行过这个窗口" —— 这是「我刚点开你就给我最小化」的唯一防线。
-                    // （之前这里漏了赋值，导致 RecentlyAllowed 永远是 false、下面的重试也永远放行不了，
-                    //   真机上就是"点了任务栏把客户端叫出来，1.2 秒后又被压回去"，得点好几遍。）
-                    _lastAllowAt = DateTime.Now;
-                    _lastAllowHwnd = hwnd;
-                    _lastAllowProc = proc;
-                    // 你接管了这个窗口：任何"打回它"的待办立刻作废
-                    _pendingBlockHwnd = IntPtr.Zero;
-                    // 连"连续弹"的判定也一起作废：用户接管过，下一次再拦就不该按连续弹处理
-                    _lastBlockedHwnd = IntPtr.Zero;
-                    lock (_sync)
+                    // 只有"有你这个人的证据"的放行才刷新保护期：点窗口、点任务栏、Alt+Tab、
+                    // 窗口第一次出现、WeGame 登录阶段。
+                    //
+                    // 绝不能因为"刚才放行过"（AllowJustAllowed）或"正在放弃拦截期"（AllowSuppressed）
+                    // 就把保护期再往后推 3 秒 —— 那样客户端只要每 2.x 秒自弹一次，就能一路续命、
+                    // 永远不被拦（真机上就是"匹配成功弹窗"漏拦）。保护期必须只由**你的动作**续期。
+                    bool userEvidence =
+                        decision.Code == DecisionCode.AllowClickedTarget ||
+                        decision.Code == DecisionCode.AllowClickedShell ||
+                        decision.Code == DecisionCode.AllowModifier ||
+                        decision.Code == DecisionCode.AllowFirstClientWindow ||
+                        decision.Code == DecisionCode.AllowWeGameLogin;
+
+                    if (userEvidence)
                     {
-                        _blockFailHwnd = IntPtr.Zero;
-                        _blockFailCount = 0;
-                        _blockFailAt = DateTime.MinValue;
+                        // 记下"刚刚放行过这个窗口" —— 这是「我刚点开你就给我最小化」的唯一防线。
+                        // （之前这里漏了赋值，导致 RecentlyAllowed 永远是 false、下面的重试也永远放行不了，
+                        //   真机上就是"点了任务栏把客户端叫出来，1.2 秒后又被压回去"，得点好几遍。）
+                        _lastAllowAt = DateTime.Now;
+                        _lastAllowHwnd = hwnd;
+                        _lastAllowProc = proc;
+                        // 你接管了这个窗口：任何"打回它"的待办立刻作废
+                        _pendingBlockHwnd = IntPtr.Zero;
+                        // 连"连续弹"的判定也一起作废：用户接管过，下一次再拦就不该按连续弹处理
+                        _lastBlockedHwnd = IntPtr.Zero;
+                        lock (_sync)
+                        {
+                            _blockFailHwnd = IntPtr.Zero;
+                            _blockFailCount = 0;
+                            _blockFailAt = DateTime.MinValue;
+                        }
                     }
                     return;
                 }
