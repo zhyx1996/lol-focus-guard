@@ -246,6 +246,11 @@ pwsh ./verify-real.ps1 -VerboseLog   # 如果那局是 --verbose 跑的，判定
   一次性凭据**（`SwitchCredentialMs=2500`，用掉即失效）——不会像固定宽限那样留一段无防时间。
   日志里对应 `识别到任务切换器（…）` 和 `放行原因: 你刚用 Alt+Tab/任务视图切窗口（…凭据用掉了）`。
   手工验证：Alt+Tab 切到客户端，然后看日志有没有这两行。
+  **另有键盘冗余通道**：15ms 采样线程发现「刚按下 Tab 且 Alt/Win 按着」时，也会打同一张凭据
+  （日志 `识别到 Alt+Tab 按键（键盘采样）`）。两条路只要有一条命中就够——浮层没画出来、
+  explorer 重启、两个全屏程序之间切换，键盘这条仍然有效。
+  端到端回归：`test-switcher.ps1`（模拟"慢客户端"：Alt+Tab 后 1.9 秒目标窗口才上来，
+  验证靠凭据放行、放行后不再打回）。
 - **英雄联盟的窗口会挡掉别的进程的 `ShowWindow`**：实测它的登录窗口
   （`Client.exe` / `TWINCONTROL`）`ShowWindow(SW_MINIMIZE)` 直接返回 `False`、窗口纹丝不动，
   `SetWindowPos` 也一样；但它认 `WM_SYSCOMMAND / SC_MINIMIZE`——`PostMessage` 过去立刻最小化。

@@ -146,6 +146,7 @@ namespace LolFocusGuard
         public const uint GA_ROOT = 2;
         public const int VK_MENU = 0x12;
         public const int VK_LWIN = 0x5B;
+        public const int VK_TAB = 0x09;
         public const int VK_RWIN = 0x5C;
         public const int WM_HOTKEY = 0x0312;
         public const uint MOD_ALT = 0x0001;
@@ -363,6 +364,9 @@ namespace LolFocusGuard
         // 只用来区分"明确的切窗口手势"（Win+数字/Win+方向）和"打游戏时的 Alt"
         // （LoL 里 Alt+Q/W/E/R 是自施法，按得极频繁 —— 拿它当接管理由就会偶发漏拦）。
         private volatile bool _lastModifierWasWin;
+
+        // Tab 键上一轮的按下状态（采样线程用，判断"刚按下去"的边沿）
+        private volatile bool _tabDown;
         // Alt+Tab 切换器状态（EVENT_SYSTEM_SWITCHSTART / SWITCHEND）：慢客户端兜底
         private IntPtr _switchHook = IntPtr.Zero;
         private volatile bool _altTabOpen;
@@ -776,6 +780,23 @@ namespace LolFocusGuard
                 // Win 优先：Alt+Win 同时按着的时候按 Win 算（Win 才是明确的切窗口手势）
                 _lastModifierWasWin = winDown;
             }
+
+            // Alt+Tab / Win+Tab 的**键盘**证据：按下的那一刻就打一张一次性切换凭据。
+            // 为什么两条路都要有：靠窗口身份认切换器（ForegroundStaging/任务切换浮层）在
+            // 这台机器上已经验证有效，但它依赖 explorer 把浮层窗口画出来；万一哪天浮层没出现
+            // （explorer 重启、两个全屏程序之间切），键盘这条路还是稳的。
+            // 只认"刚按下去"的那一下（边沿），按住不放不会一直续期。
+            bool tabDown = (Native.GetAsyncKeyState(Native.VK_TAB) & 0x8000) != 0;
+            if (tabDown && !_tabDown && (altDown || winDown))
+            {
+                _switchCredentialAt = Clock.NowMs();
+                if (_verbose)
+                {
+                    Log(string.Format("识别到 {0}+Tab 按键（键盘采样）：给你下一次窗口激活一张一次性凭据（{1}ms 内有效）",
+                        winDown ? "Win" : "Alt", FocusRules.SwitchCredentialMs));
+                }
+            }
+            _tabDown = tabDown;
         }
         /// <summary>鼠标指针下面那个顶层窗口属于哪个进程。</summary>
         private static string ProcUnderCursor()
