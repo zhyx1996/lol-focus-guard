@@ -215,6 +215,8 @@ namespace LolFocusGuard
         private readonly bool _verbose;
         private readonly bool _noClickAllow;
         private static readonly string OwnProcessName = Process.GetCurrentProcess().ProcessName;
+        // 日志超过 8MB 就轮转成 guard.log.1（排查用最近这份就够了）
+        private const long LOG_ROTATE_BYTES = 8L * 1024 * 1024;
         private readonly object _logLock = new object();
         // 日志异步写：Log() 只入队（能在 WinEvent/钩子回调线程上安全调用，不会因为 Defender 扫盘
         // 把系统回调拖住几十毫秒）；后台线程每 200ms 或攒够 64 行批量落盘。
@@ -2208,6 +2210,23 @@ namespace LolFocusGuard
             {
                 lock (_logLock)
                 {
+                    // 日志无上限地长下去迟早出问题（长时间开 --verbose 一天能写几十 MB，
+                    // 用户也不会自己去清）。超过上限就轮转一次：guard.log → guard.log.1（覆盖上一份），
+                    // 一份 8MB 够存几万行，排查用最近这份就够了。
+                    try
+                    {
+                        FileInfo fi = new FileInfo(_logPath);
+                        if (fi.Exists && fi.Length > LOG_ROTATE_BYTES)
+                        {
+                            string backup = _logPath + ".1";
+                            if (File.Exists(backup)) File.Delete(backup);
+                            File.Move(_logPath, backup);
+                        }
+                    }
+                    catch
+                    {
+                        // 轮转失败就继续往原文件写，不影响功能
+                    }
                     // 还是用 AppendAllText：行为和原来逐行写完全一致（含首次写文件时的 UTF-8 BOM），
                     // 只是现在一次写一批。
                     File.AppendAllText(_logPath, sb.ToString(), Encoding.UTF8);
