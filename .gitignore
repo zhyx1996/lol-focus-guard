@@ -7,3 +7,6 @@ lcu-dir.txt
 # 运行时
 guard.log
 *.log
+
+# Isolated builds
+artifacts/

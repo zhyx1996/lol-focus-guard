@@ -4,6 +4,7 @@
 
 # 英雄联盟客户端
 LeagueClientUx
+LeagueClient
 RiotClientServices
 
 # WeGame（启动、更新完成、启动游戏时的那一下抢焦点）

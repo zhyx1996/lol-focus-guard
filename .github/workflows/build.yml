@@ -16,6 +16,14 @@ jobs:
         shell: pwsh
         run: ./build.ps1 -SkipStop
 
+      - name: 规则与事件序列回归测试
+        shell: pwsh
+        run: |
+          ./LogicTest.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./StateTest.exe
+          exit $LASTEXITCODE
+
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
