@@ -1384,7 +1384,13 @@ namespace LolFocusGuard
                     // 过渡窗口（ForegroundStaging / 任务视图）既不是"你要去的地方"，
                     // 也不该把点击证据吃掉 —— 否则证据在中间窗口就被消费完，真正的目标窗口来了反而没凭据。
                     bool transitional = ProcClass.IsSwitcherWindow(proc, title, cls);
-                    if (!transitional && IsTopLevel(hwnd) &&
+                    // 任务栏 / 托盘溢出 / 开始菜单 / 任务视图这些"入口"窗口也不当"可回退目标"：
+                    // 打回之后把前台交还给任务栏毫无意义，真机日志里就出现过
+                    // "打回后前台没有回到预期窗口（预期 explorer，实际 ChatGPT）" ——
+                    // 预期之所以是 explorer，正是因为上一跳被任务栏占了位置，把你真正在用的
+                    // ChatGPT 从"可回退目标"里挤掉了。跳过这些入口，交还目标才是你刚才在用的窗口。
+                    bool shellEntryWindow = IsShellProcess(proc) && IsShellClickClass(cls);
+                    if (!transitional && !shellEntryWindow && IsTopLevel(hwnd) &&
                         !string.Equals(proc, OwnProcessName, StringComparison.OrdinalIgnoreCase))
                     {
                         _lastForeground = hwnd;
