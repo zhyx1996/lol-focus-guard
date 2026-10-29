@@ -1464,6 +1464,8 @@ namespace LolFocusGuard
                 // 客户端已经起来之后再冒出来的（"游戏进程已启动"那张卡片）才拦。
                 facts.WeGameLoginPhase = IsWeGameProcess(proc) && !_clientRunning;
                 // 客户端刚起来这 20 秒里，WeGame 的窗口递上来算"启动流程"，不按自弹打回去
+                // 它现在就是最小化状态却来抢前台（真机 22:17:18 抓到过）：不压回，见 Rules.cs 的注释
+                facts.SelfMinimized = Native.IsIconic(hwnd);
                 facts.WeGameLaunchGrace = IsWeGameProcess(proc) && _clientRunning &&
                                           _clientStartedAt != Clock.Never &&
                                           Clock.AgeMs(_clientStartedAt) <= FocusRules.WeGameLaunchGraceMs;
@@ -1597,6 +1599,12 @@ namespace LolFocusGuard
                         _lastWegameAllowLogAt = Clock.NowMs();
                         Log(string.Format("放行 WeGame 窗口（登录阶段，客户端还没起来）：class={0}，标题=\"{1}\"",
                             ClassNameOf(hwnd), TitleOf(hwnd)));
+                    }
+                    break;
+                case DecisionCode.AllowSelfMinimized:
+                    if (_verbose)
+                    {
+                        Log(string.Format("放行原因: 它自己就是最小化状态（{0}），压回去只会打断它的还原", where));
                     }
                     break;
                 case DecisionCode.AllowWeGameLaunch:

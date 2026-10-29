@@ -23,6 +23,16 @@ namespace LolFocusGuard
         /// </summary>
         public bool WeGameLaunchGrace;
 
+        /// <summary>
+        /// 这个窗口**当前**就是最小化状态（IsIconic），却来抢前台。
+        ///
+        /// 真机日志（22:17:18 / 22:17:27）抓到客户端把它的最小化占位窗口
+        /// （尺寸=237x39@(-32000,-32000)、最小化=True）设成前台：
+        /// 这种窗口一像素都不显示，压回去没有任何收益，却会把前台从你刚要打开的那个窗口抢走
+        /// —— 你点了一次任务栏，客户端的还原链条被我们打断，表现就是"点好几遍才切出来"。
+        /// </summary>
+        public bool SelfMinimized;
+
         /// <summary>被切到前台的窗口是客户端进程的窗口，且是第一次见到。</summary>
         public bool FirstClientWindow;
 
@@ -88,6 +98,7 @@ namespace LolFocusGuard
     {
         AllowWeGameLogin,
         AllowWeGameLaunch,
+        AllowSelfMinimized,
         AllowFirstClientWindow,
         AllowSuppressed,
         AllowJustUnlocked,
@@ -135,6 +146,11 @@ namespace LolFocusGuard
         {
             // 0) --no-click-allow：测试模式，什么都不放行
             if (f.TestModeOnly) return new Decision(false, DecisionCode.BlockTestMode);
+
+            // 0.5) 它自己就是最小化状态（IsIconic）→ 不打扰。
+            //      最小化窗口不显示任何像素，压回去只有副作用：把前台从你正要打开的窗口抢走，
+            //      打断客户端自己"最小化 → 还原"的链条（真机表现：点一次任务栏，它还是不出来）。
+            if (f.SelfMinimized) return new Decision(true, DecisionCode.AllowSelfMinimized);
 
             // 1) 国服登录阶段：客户端还没起来，WeGame 的窗口全放行
             if (f.WeGameLoginPhase) return new Decision(true, DecisionCode.AllowWeGameLogin);

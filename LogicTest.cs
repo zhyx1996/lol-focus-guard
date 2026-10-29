@@ -152,6 +152,20 @@ internal static class LogicTest
 
         // ---- 放行：登录 / 启动阶段 ----
         f = Idle();
+        f.SelfMinimized = true;
+        Case("它自己就是最小化状态却抢前台 → 放行（压回去只会打断它的还原）", f, true, DecisionCode.AllowSelfMinimized);
+
+        f = Idle();
+        f.SelfMinimized = true;
+        f.ClickAgeMs = 100;
+        f.ClickOnTarget = false;   // 指针甚至按在别处
+        Case("最小化窗口放行优先于「按在别处」→ 仍放行（它没显示任何像素）", f, true, DecisionCode.AllowSelfMinimized);
+
+        f = Idle();
+        f.SelfMinimized = false;
+        Case("不是最小化状态 → 不走这条放行", f, false, DecisionCode.BlockNoClick);
+
+        f = Idle();
         f.WeGameLoginPhase = true;
         Case("客户端没起来时的 WeGame 窗口 → 放行（登录面板）", f, true, DecisionCode.AllowWeGameLogin);
 
