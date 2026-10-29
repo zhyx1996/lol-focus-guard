@@ -120,7 +120,18 @@ $skipped = $false
     }
     $pass = $true
     if ($idx -lt 0) { 'A 结果: 跳过（合成的点击没产生前台切换：注入被安全软件吃掉了，这一条无法判定）'; $skipped = $true }
-    elseif ($idx + 1 -lt $lines.Count -and $lines[$idx + 1] -match '拦截 #') { 'A 结果: FAIL（用户点击被拦了）'; $pass = $false }
+    else {
+        # 注意：点击放行时日志是「前台变化 → …」+「放行原因: 你点了这个窗口」；
+        # 万一被误拦，中间还会先插一条「不放行: …」，然后是「拦截 #N」—— 所以不能只看紧接的那一行，
+        # 要一直看到下一条「前台变化」为止（之前只看 idx+1，误拦时会漏判成 PASS）。
+        $blockedA = $false
+        for ($j = $idx + 1; $j -lt $lines.Count; $j++) {
+            if ($lines[$j] -match '前台变化 →') { break }
+            if ($lines[$j] -match '拦截 #') { $blockedA = $true; break }
+        }
+        if ($blockedA) { 'A 结果: FAIL（用户点击被拦了）'; $pass = $false }
+        else { 'A 结果: PASS（点击被识别为用户操作，未拦）' }
+    }
     else { 'A 结果: PASS（点击被识别为用户操作，未拦）' }
 
 } else { 'A 结果: 跳过（输入注入被安全软件拦了）'; $skipped = $true }

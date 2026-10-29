@@ -59,7 +59,6 @@ namespace LolFocusGuard
 
     internal enum DecisionCode
     {
-        AllowTestMode,        // 理论上不会出现（测试模式下直接拦）
         AllowWeGameLogin,
         AllowFirstClientWindow,
         AllowSuppressed,

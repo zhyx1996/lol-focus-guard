@@ -216,6 +216,17 @@ namespace LolFocusGuard
         private readonly bool _noClickAllow;
         private static readonly string OwnProcessName = Process.GetCurrentProcess().ProcessName;
         private readonly object _logLock = new object();
+        // 日志异步写：Log() 只入队（能在 WinEvent/钩子回调线程上安全调用，不会因为 Defender 扫盘
+        // 把系统回调拖住几十毫秒）；后台线程每 200ms 或攒够 64 行批量落盘。
+        private const int LOG_FLUSH_INTERVAL_MS = 200;
+        private const int LOG_FLUSH_LINES = 64;
+        private const int LOG_QUEUE_MAX = 4096; // 极端情况下（磁盘卡死）别把内存吃光
+        private readonly System.Collections.Concurrent.ConcurrentQueue<string> _logQueue =
+            new System.Collections.Concurrent.ConcurrentQueue<string>();
+        private readonly System.Threading.AutoResetEvent _logSignal =
+            new System.Threading.AutoResetEvent(false);
+        private readonly System.Threading.Thread _logThread;
+        private int _logDropped;
         private readonly Native.WinEventDelegate _callback;
         private readonly System.Threading.Thread _pollThread;
         private volatile bool _disposed;
@@ -228,21 +239,23 @@ namespace LolFocusGuard
 
         private volatile bool _targetWasMinimized;
         private volatile bool _paused;
+        // 暂停的"显示用"截止时间（托盘/日志里给人看）；判定用的是下面的单调时钟版本
         private DateTime _resumeAt = DateTime.MinValue;
+        private long _pauseStartedAtMs = Clock.Never;
+        private long _pauseDurationMs;
         private int _blockCount;
-        private DateTime _lastIconicAt = DateTime.MinValue;
         // 每个目标窗口"上一次处于最小化"的时间，用来判断弹出来的那一刻它是不是从最小化状态恢复的
-        private readonly Dictionary<IntPtr, DateTime> _iconicAt = new Dictionary<IntPtr, DateTime>();
+        private readonly Dictionary<IntPtr, long> _iconicAt = new Dictionary<IntPtr, long>();
         private readonly List<int> _targetPids = new List<int>();
         private int _scanTick;
-        private DateTime _lastBlockRequestAt = DateTime.MinValue;
+        private long _lastBlockRequestAt = Clock.Never;
         private int _pollTicks;
-        private DateTime _lastBlockAt = DateTime.MinValue;
+        private long _lastBlockAt = Clock.Never;
         private IntPtr _lastBlockedHwnd = IntPtr.Zero;
 
         // pid → 进程名缓存（热路径里不能每 50ms 都去 new Process，那是几十毫秒的开销）
         private readonly Dictionary<int, string> _pidNames = new Dictionary<int, string>();
-        private DateTime _pidNamesClearedAt = DateTime.Now;
+        private long _pidNamesClearedAt = Clock.NowMs();
 
         // 专用动作线程：比线程池调度快，延迟能压到几毫秒
         private readonly Queue<Action> _actions = new Queue<Action>();
@@ -251,18 +264,19 @@ namespace LolFocusGuard
         private readonly System.Threading.Thread _actionThread;
         private int _lastEventLatencyMs = -1;
 
-        // LCU 登录状态：0=未知 1=已登录 2=确定未登录
+        // LCU 登录状态：0=未知 1=已登录 2=确定未登录（只写日志，不参与判定，见 README）
         private readonly string _lcuDir;
         private int _loginState;
         private bool _loginStateLogged;
-        private DateTime _loginCheckedAt = DateTime.MinValue;
-        private DateTime _lastLoginLogAt = DateTime.MinValue;
         private string _lcuLockfile;
         private volatile bool _clientRunning;
-        private DateTime _clientCheckAt = DateTime.MinValue;
-        private DateTime _lastWegameAllowLogAt = DateTime.MinValue;
-        // 已经见过的目标窗口（只放过"第一次出现"的窗口）
+        private long _clientCheckAt = Clock.Never;
+        private long _lastWegameAllowLogAt = Clock.Never;
+        // 已经见过的目标窗口（只放过"第一次出现"的窗口）。
+        // 带上限：客户端窗口增删频繁时会慢慢涨，超了就按插入顺序丢掉最旧的一批（不要求精确 LRU）。
+        private const int KNOWN_WINDOWS_MAX = 512;
         private readonly HashSet<IntPtr> _knownWindows = new HashSet<IntPtr>();
+        private readonly Queue<IntPtr> _knownWindowOrder = new Queue<IntPtr>();
 
         // ---- 低级输入钩子：区分"你自己切过去的"和"进程强制抢前台" ----
         // 判定用的两个时间窗口只有一份定义（在 Rules.cs），这里只是别名，避免两边改漏一边
@@ -277,37 +291,38 @@ namespace LolFocusGuard
         private IntPtr _kbdHook = IntPtr.Zero;
         private Native.LowLevelHookProc _mouseProc;
         private Native.LowLevelHookProc _kbdProc;
-        private DateTime _lastInputAt = DateTime.MinValue;
+        private long _lastInputAt = Clock.Never;
         private string _lastInputWhere = string.Empty; // 鼠标按下时指针压在哪个进程的窗口上
         private int _inputCount;
         private volatile int _inputAgeMs = int.MaxValue; // 最后一次输入距今（系统级，不信钩子）
-        private string _cursorProcNow = "";
-        private string _cursorProcPrev = "";
-        private DateTime _lastAllowAt = DateTime.MinValue;
+        private long _lastAllowAt = Clock.Never;
         private IntPtr _lastAllowHwnd = IntPtr.Zero;
         private volatile string _lastAllowProc = "";
         // 待打回的目标窗口：只有「拦过一次、它又赖在前台」才重试；用户一接管就作废
         private IntPtr _pendingBlockHwnd = IntPtr.Zero;
-        private DateTime _pendingBlockAt = DateTime.MinValue;
+        private long _pendingBlockAt = Clock.Never;
         // 防拉锯：判据是「我们**压不动**它」，不是「我们拦了几次」。
         // 成功的拦截一次都不计入；只有动作落地后前台仍被它占着才算一次失败，
         // 10 秒内连续失败 5 次才放弃 15 秒（原来是按调用次数算，重试也算，等于一次没压住就自废一分钟）。
         private IntPtr _blockFailHwnd = IntPtr.Zero;
         private int _blockFailCount;
-        private DateTime _blockFailAt = DateTime.MinValue;
-        private DateTime _lastSuppressedLogAt = DateTime.MinValue;
-        private readonly Dictionary<IntPtr, DateTime> _suppressedUntil = new Dictionary<IntPtr, DateTime>();
+        private long _blockFailAt = Clock.Never;
+        private long _lastSuppressedLogAt = Clock.Never;
+        // 放弃拦截：存"从什么时候开始放弃"（而不是"放弃到几点"），这样判定只需要算差值，
+        // 不会被系统时钟往回拨搞成"无限期放弃"。
+        private const int SUPPRESS_MS = 15000;
+        private readonly Dictionary<IntPtr, long> _suppressedFrom = new Dictionary<IntPtr, long>();
         // Alt / Win 最后一次按下的时间：这两个键才是"切窗口"用的
-        private DateTime _lastModifierAt = DateTime.MinValue;
+        private long _lastModifierAt = Clock.Never;
         // Alt+Tab 切换器状态（EVENT_SYSTEM_SWITCHSTART / SWITCHEND）：慢客户端兜底
         private IntPtr _switchHook = IntPtr.Zero;
         private volatile bool _altTabOpen;
-        private DateTime _lastSwitchStartAt = DateTime.MinValue;
-        private DateTime _lastSwitchEndAt = DateTime.MinValue;
+        private long _lastSwitchStartAt = Clock.Never;
+        private long _lastSwitchEndAt = Clock.Never;
         private int _switchCount;
         // 切换器"开着"最多认多久：SWITCHEND 丢掉时不能让守卫永久放行（见 PollOnce 里的自愈）
         private const int SWITCH_MAX_OPEN_MS = 10000;
-        private DateTime _lastClickAt = DateTime.MinValue;
+        private long _lastClickAt = Clock.Never;
         private string _lastClickWhere = "";
         // 按下那一刻指针命中的窗口类名：用来把"点任务栏"和"点资源管理器文件夹窗口"分开
         // （两者同属 explorer.exe，只看进程名分不出来）
@@ -368,6 +383,13 @@ namespace LolFocusGuard
             _mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _mouseProc, hMod, 0);
             _kbdHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, _kbdProc, hMod, 0);
 
+            // 日志落盘线程：先起来，免得下面第一句 Log 入队没人写
+            _logThread = new System.Threading.Thread(LogWriterLoop);
+            _logThread.IsBackground = true; // 后台线程：写盘卡住也不能拦着进程退出
+            _logThread.Priority = System.Threading.ThreadPriority.BelowNormal;
+            _logThread.Name = "LolFocusGuard-log";
+            _logThread.Start();
+
             _pollThread = new System.Threading.Thread(PollLoop);
             _pollThread.IsBackground = true;
             _pollThread.Priority = System.Threading.ThreadPriority.AboveNormal;
@@ -418,13 +440,16 @@ namespace LolFocusGuard
         public void Pause(TimeSpan duration)
         {
             _paused = true;
-            _resumeAt = DateTime.Now.Add(duration);
+            _pauseDurationMs = (long)duration.TotalMilliseconds;
+            _pauseStartedAtMs = Clock.NowMs();
+            _resumeAt = DateTime.Now.Add(duration); // 只用于显示（托盘/日志）
             Log("已暂停至 " + _resumeAt.ToString("HH:mm:ss"));
         }
 
         public void Resume()
         {
             _paused = false;
+            _pauseStartedAtMs = Clock.Never;
             _resumeAt = DateTime.MinValue;
             Log("已恢复运行");
         }
@@ -443,7 +468,8 @@ namespace LolFocusGuard
         {
             try
             {
-                if (_paused && _resumeAt != DateTime.MinValue && DateTime.Now >= _resumeAt)
+                if (_paused && _pauseStartedAtMs != Clock.Never &&
+                    Clock.AgeMs(_pauseStartedAtMs) >= _pauseDurationMs)
                 {
                     Resume();
                 }
@@ -451,7 +477,7 @@ namespace LolFocusGuard
                 // Alt+Tab 切换器"开着"不能是无期限的：SWITCHEND 有可能收不到（切换器被别的程序关掉、
                 // 钩子错过事件、以鼠标点选结束切换），一旦 _altTabOpen 卡在 true，就等于**永久放行一切**，
                 // 守卫彻底失效。所以按"开着最多认 10 秒"自己兜底复位（正常 Alt+Tab 也就 1~2 秒）。
-                if (_altTabOpen && (DateTime.Now - _lastSwitchStartAt).TotalMilliseconds > SWITCH_MAX_OPEN_MS)
+                if (_altTabOpen && Clock.AgeMs(_lastSwitchStartAt) > SWITCH_MAX_OPEN_MS)
                 {
                     _altTabOpen = false;
                     Log("提示：Alt+Tab 切换器状态超时自动复位（没收到 SWITCHEND，最多认 " + SWITCH_MAX_OPEN_MS + "ms）");
@@ -467,17 +493,11 @@ namespace LolFocusGuard
                 if (_targetHwnd != IntPtr.Zero && Native.IsWindow(_targetHwnd))
                 {
                     _targetWasMinimized = Native.IsIconic(_targetHwnd);
-                    if (_targetWasMinimized) _lastIconicAt = DateTime.Now;
                 }
 
                 // 每轮都更新"最后一次输入距今多久"和 Alt/Win 状态：
                 // 这是不依赖任何钩子的系统级事实，安全软件（WeGame 的 ACE / SGuard）拦不住。
                 UpdateInputState();
-
-                // 指针下面是谁：每轮(50ms)采一次，并留一份上一轮的。
-                // 判定"是不是你点的"时用上一轮的值 —— 理由见 ProcessForeground 里的注释。
-                _cursorProcPrev = _cursorProcNow;
-                _cursorProcNow = ProcUnderCursor();
 
                 // 每 4 个 tick 扫一遍目标进程的窗口，记下谁现在是最小化的
                 if ((_scanTick++ % 4) == 0) ScanIconic();
@@ -501,7 +521,7 @@ namespace LolFocusGuard
                     ProcessForeground(fg, false);
                 }
                 else if (fg != IntPtr.Zero && fg == _pendingBlockHwnd &&
-                         (DateTime.Now - _pendingBlockAt).TotalMilliseconds > RETRY_MS)
+                         Clock.AgeMs(_pendingBlockAt) > RETRY_MS)
                 {
                     // 打回过一次、它却还赖在前台（上次没压下去）：再试一次。
                     // 但只要你在此期间自己放行过它（点任务栏/点窗口/Alt+Tab），这个待办立刻作废 ——
@@ -512,13 +532,17 @@ namespace LolFocusGuard
                     // 而 retry 分支强制忽略点击证据 → 把你正要打开的窗口又压回去。
                     // 所以判据是「这次拦截**之后**你有没有按过鼠标/Alt/Win」，而不是「最近有没有输入」；
                     // 并且按下的落点得像个切换动作（shell 的点击入口，或目标进程的窗口）。
+                    // "这次拦截之后你有没有按过鼠标/Modifier" 用"谁更近"来判断：
+                    // AgeMs 越小越新，所以"点击比拦截更晚"= AgeMs(点击) < AgeMs(拦截)。
+                    double blockAge = Clock.AgeMs(_pendingBlockAt);
+                    double clickAge = Clock.AgeMs(_lastClickAt);
+                    double modifierAge = Clock.AgeMs(_lastModifierAt);
                     bool userTakingOver =
-                        (_lastClickAt > _pendingBlockAt &&
-                         (DateTime.Now - _lastClickAt).TotalMilliseconds <= SHELL_CLICK_GRACE_MS &&
+                        (clickAge < blockAge && clickAge <= SHELL_CLICK_GRACE_MS &&
                          (IsShellClickClass(_lastClickClass) || _targets.Contains(_lastClickWhere))) ||
-                        (_lastModifierAt > _pendingBlockAt);
+                        (modifierAge < blockAge);
 
-                    if (_paused || _lastAllowAt > _pendingBlockAt || userTakingOver)
+                    if (_paused || Clock.AgeMs(_lastAllowAt) < blockAge || userTakingOver)
                     {
                         _pendingBlockHwnd = IntPtr.Zero;
                     }
@@ -533,7 +557,7 @@ namespace LolFocusGuard
                 {
                     Log(string.Format("心跳 fg={0} 按键={1} 点击采样={2}/钩子={3} 切换器事件={4}次 钩子输入={5}次 最后输入={6}ms前({7})",
                         ProcNameOf(fg),
-                        _lastClickAt == DateTime.MinValue ? "没按过或已用掉" : string.Format("{0:0}ms前@{1}", (DateTime.Now - _lastClickAt).TotalMilliseconds, _lastClickWhere.Length > 0 ? _lastClickWhere : "?"),
+                        _lastClickAt == Clock.Never ? "没按过或已用掉" : string.Format("{0:0}ms前@{1}", Clock.AgeMs(_lastClickAt), _lastClickWhere.Length > 0 ? _lastClickWhere : "?"),
                         _clickCount,
                         _hookClickCount,
                         _switchCount,
@@ -558,7 +582,7 @@ namespace LolFocusGuard
                 pids = new List<int>(_targetPids);
             }
 
-            DateTime now = DateTime.Now;
+            long now = Clock.NowMs();
             Native.EnumWindows(delegate(IntPtr h, IntPtr l)
             {
                 uint pid;
@@ -579,9 +603,9 @@ namespace LolFocusGuard
         {
             lock (_sync)
             {
-                DateTime t;
+                long t;
                 return _iconicAt.TryGetValue(hwnd, out t) &&
-                       (DateTime.Now - t).TotalSeconds < seconds;
+                       Clock.AgeMs(t) < seconds * 1000.0;
             }
         }
 
@@ -615,7 +639,7 @@ namespace LolFocusGuard
                     {
                         _lastClickWhere = ProcUnderCursor();
                         _lastClickClass = ClassUnderCursor();
-                        _lastClickAt = DateTime.Now;
+                        _lastClickAt = Clock.NowMs();
                         _clickCount++;
                     }
                     _mouseWasDown = down;
@@ -653,7 +677,7 @@ namespace LolFocusGuard
                 (Native.GetAsyncKeyState(Native.VK_LWIN) & 0x8000) != 0 ||
                 (Native.GetAsyncKeyState(Native.VK_RWIN) & 0x8000) != 0)
             {
-                _lastModifierAt = DateTime.Now;
+                _lastModifierAt = Clock.NowMs();
             }
         }
         /// <summary>鼠标指针下面那个顶层窗口属于哪个进程。</summary>
@@ -783,8 +807,8 @@ namespace LolFocusGuard
         /// <summary>客户端进程在不在（WeGame 登录窗口只在客户端起来之前出现，用它当判据）。</summary>
         private void RefreshClientRunning()
         {
-            if ((DateTime.Now - _clientCheckAt).TotalMilliseconds < 800) return;
-            _clientCheckAt = DateTime.Now;
+            if (Clock.AgeMs(_clientCheckAt) < 800) return;
+            _clientCheckAt = Clock.NowMs();
 
             bool running = false;
             string[] names = { "LeagueClientUx", "LeagueClient", "RiotClientServices" };
@@ -1037,7 +1061,7 @@ namespace LolFocusGuard
                 _targetPids.AddRange(pids);
                 if (markKnown)
                 {
-                    foreach (IntPtr h in found) _knownWindows.Add(h);
+                    foreach (IntPtr h in found) RememberWindow(h);
                 }
             }
 
@@ -1071,14 +1095,14 @@ namespace LolFocusGuard
             if (eventType == Native.EVENT_SYSTEM_SWITCHSTART)
             {
                 _altTabOpen = true;
-                _lastSwitchStartAt = DateTime.Now;
+                _lastSwitchStartAt = Clock.NowMs();
                 _switchCount++;
                 return;
             }
             if (eventType == Native.EVENT_SYSTEM_SWITCHEND)
             {
                 _altTabOpen = false;
-                _lastSwitchEndAt = DateTime.Now;
+                _lastSwitchEndAt = Clock.NowMs();
                 _switchCount++;
                 return;
             }
@@ -1141,10 +1165,10 @@ namespace LolFocusGuard
 
             lock (_pidNames)
             {
-                if ((DateTime.Now - _pidNamesClearedAt).TotalSeconds > 60)
+                if (Clock.AgeMs(_pidNamesClearedAt) > 60000)
                 {
                     _pidNames.Clear();
-                    _pidNamesClearedAt = DateTime.Now;
+                    _pidNamesClearedAt = Clock.NowMs();
                 }
                 string cached;
                 if (_pidNames.TryGetValue(key, out cached)) return cached;
@@ -1169,10 +1193,10 @@ namespace LolFocusGuard
         /// </summary>
         private void ConsumeClickEvidenceIfUsed()
         {
-            DateTime usedClickAt = _lastClickAt;
-            if (usedClickAt == DateTime.MinValue) return;
+            long usedClickAt = _lastClickAt;
+            if (usedClickAt == Clock.Never) return;
 
-            double age = (DateTime.Now - usedClickAt).TotalMilliseconds;
+            double age = Clock.AgeMs(usedClickAt);
             string where = _lastClickWhere;
             bool shellClick = IsShellProcess(where) && IsShellClickClass(_lastClickClass) &&
                               age <= SHELL_CLICK_GRACE_MS;
@@ -1182,7 +1206,7 @@ namespace LolFocusGuard
             // 只消费"刚刚判定用的那一份"：用户在这中间新按的一下不能被吃掉。
             if (_lastClickAt != usedClickAt) return;
 
-            _lastClickAt = DateTime.MinValue; // 证据用掉
+            _lastClickAt = Clock.Never; // 证据用掉
             _lastClickWhere = string.Empty;
             _lastClickClass = string.Empty;
         }
@@ -1218,9 +1242,9 @@ namespace LolFocusGuard
                     Log(string.Format("前台变化 → {0} (pid={1}) class={2} 标题=\"{3}\" 尺寸={4} 最小化={5} 按键={6}",
                         proc, ProcIdOf(hwnd), ClassNameOf(hwnd), TitleOf(hwnd), size,
                         Native.IsIconic(hwnd),
-                        _lastClickAt == DateTime.MinValue
+                        _lastClickAt == Clock.Never
                             ? "没按过或已用掉"
-                            : string.Format("{0:0}ms前@{1}", (DateTime.Now - _lastClickAt).TotalMilliseconds,
+                            : string.Format("{0:0}ms前@{1}", Clock.AgeMs(_lastClickAt),
                                 _lastClickWhere.Length > 0 ? _lastClickWhere : "?")));
                 }
 
@@ -1260,23 +1284,23 @@ namespace LolFocusGuard
                 //   · 同一个 hwnd：3 秒（你刚才就在用它，这条是"点不出来"的防线，不能动）；
                 //   · 同进程的**另一个已知窗口**：600ms（再宽就成了"点过客户端任何一处，
                 //    它 3 秒内自弹什么都被放行"；客户端新造的 hwnd 连这条都不给）。
-                double allowAgeMs = (DateTime.Now - _lastAllowAt).TotalMilliseconds;
+                double allowAgeMs = Clock.AgeMs(_lastAllowAt);
                 bool sameHwnd = hwnd == _lastAllowHwnd;
                 bool sameProc = !sameHwnd && knownBefore && _lastAllowProc.Length > 0 &&
                                 string.Equals(proc, _lastAllowProc, StringComparison.OrdinalIgnoreCase);
                 facts.SameWindowJustAllowed = sameHwnd && allowAgeMs < JUST_ALLOWED_MS;
                 facts.SameProcJustAllowed = sameProc && allowAgeMs < JUST_ALLOWED_PROC_MS;
-                facts.ModifierIdleMs = (DateTime.Now - _lastModifierAt).TotalMilliseconds;
+                facts.ModifierIdleMs = Clock.AgeMs(_lastModifierAt);
                 // Alt+Tab 兜底：切换器开着，或者刚松开（SWITCHEND 之后 2.5 秒内）。
                 // 慢客户端"Alt+Tab 过去 2 秒后才画出来"就靠这条救，1.5 秒的 Alt 宽限不够。
                 facts.Switching = _altTabOpen;
-                facts.SwitchEndedMs = (DateTime.Now - _lastSwitchEndAt).TotalMilliseconds;
+                facts.SwitchEndedMs = Clock.AgeMs(_lastSwitchEndAt);
                 // 「你手动切窗口」的硬证据：鼠标物理按键真的按下了（ClickWatchLoop 每 15ms 采一次），
                 // 以及按下那一刻指针落在谁身上。它自己抢前台的时候一个按键都没有，这条能把两者分开。
                 // 记下本次判定用的那一份点击证据（下面"用完即弃"要确认消费的还是同一份，
                 // 不能把用户在这中间新按的一下吃掉）。
-                DateTime usedClickAt = _lastClickAt;
-                facts.ClickAgeMs = (DateTime.Now - usedClickAt).TotalMilliseconds;
+                long usedClickAt = _lastClickAt;
+                facts.ClickAgeMs = Clock.AgeMs(usedClickAt);
                 // 重试轮里窗口已经在最前面、指针必然压着它 —— 那一轮不能把"指针在它上面"算成你点的
                 string where = _lastClickWhere;
                 facts.ClickOnTarget = !retry && _targets.Contains(where);
@@ -1321,7 +1345,7 @@ namespace LolFocusGuard
                         // 注意：AllowJustAllowed / AllowJustAllowedProc 不在 userEvidence 里 ——
                         // 那两种放行本身是"上次放行的余温"，不能用来续期，否则客户端每 2.x 秒
                         // 自弹一次就能无限续命（真机已复现）。
-                        _lastAllowAt = DateTime.Now;
+                        _lastAllowAt = Clock.NowMs();
                         _lastAllowHwnd = hwnd;
                         _lastAllowProc = proc;
                         // 你接管了这个窗口：任何"打回它"的待办立刻作废
@@ -1332,7 +1356,7 @@ namespace LolFocusGuard
                         {
                             _blockFailHwnd = IntPtr.Zero;
                             _blockFailCount = 0;
-                            _blockFailAt = DateTime.MinValue;
+                            _blockFailAt = Clock.Never;
                         }
                     }
 
@@ -1349,7 +1373,7 @@ namespace LolFocusGuard
                 }
 
                 _pendingBlockHwnd = hwnd;
-                _pendingBlockAt = DateTime.Now;
+                _pendingBlockAt = Clock.NowMs();
                 Block(hwnd);
             }
         }
@@ -1361,10 +1385,10 @@ namespace LolFocusGuard
             {
                 case DecisionCode.AllowWeGameLogin:
                     if (_verbose) Log("放行原因: WeGame 登录阶段（客户端还没起来）");
-                    else if ((DateTime.Now - _lastWegameAllowLogAt).TotalSeconds > 3)
+                    else if (Clock.AgeMs(_lastWegameAllowLogAt) > 3000)
                     {
                         // 非 verbose 下也留一条证据，方便排查"到底放行了哪个窗口"
-                        _lastWegameAllowLogAt = DateTime.Now;
+                        _lastWegameAllowLogAt = Clock.NowMs();
                         Log(string.Format("放行 WeGame 窗口（登录阶段，客户端还没起来）：class={0}，标题=\"{1}\"",
                             ClassNameOf(hwnd), TitleOf(hwnd)));
                     }
@@ -1374,11 +1398,11 @@ namespace LolFocusGuard
                     break;
                 case DecisionCode.AllowSuppressed:
                     if (_verbose) Log("放行原因: 正在放弃拦截期（刚才拦太多次）");
-                    else if ((DateTime.Now - _lastSuppressedLogAt).TotalSeconds > 3)
+                    else if (Clock.AgeMs(_lastSuppressedLogAt) > 3000)
                     {
                         // 放弃拦截期里也必须留证据：不然用户只看到"弹窗又出来了"，
                         // 会以为守卫没在跑（这条原来在非 verbose 下完全静默）。
-                        _lastSuppressedLogAt = DateTime.Now;
+                        _lastSuppressedLogAt = Clock.NowMs();
                         Log(string.Format("放弃拦截期内放行（不再压回去）：{0}（pid={1}，标题=\"{2}\"）",
                             ProcNameOfCached(hwnd), ProcIdOf(hwnd), TitleOf(hwnd)));
                     }
@@ -1398,7 +1422,7 @@ namespace LolFocusGuard
                         Log(_altTabOpen
                             ? "放行原因: Alt+Tab 切换器还开着（还没松手，是你在切）"
                             : string.Format("放行原因: 刚用 Alt+Tab 切完窗口（切换器关掉 {0:0}ms，{1}ms 内都算你切的）",
-                                (DateTime.Now - _lastSwitchEndAt).TotalMilliseconds, FocusRules.SwitchEndGraceMs));
+                                Clock.AgeMs(_lastSwitchEndAt), FocusRules.SwitchEndGraceMs));
                     }
                     break;
                 case DecisionCode.AllowPrevWindowGone:
@@ -1413,10 +1437,10 @@ namespace LolFocusGuard
                 case DecisionCode.BlockNoClick:
                     if (_verbose)
                     {
-                        Log(_lastClickAt == DateTime.MinValue
+                        Log(_lastClickAt == Clock.Never
                             ? "不放行: 没有尚未用掉的鼠标按键（它是自己弹的）"
                             : string.Format("不放行: {0:0}ms 内没有鼠标按键按下（它是自己弹的）",
-                                (DateTime.Now - _lastClickAt).TotalMilliseconds));
+                                Clock.AgeMs(_lastClickAt)));
                     }
                     break;
                 case DecisionCode.BlockClickElsewhere:
@@ -1447,7 +1471,7 @@ namespace LolFocusGuard
         {
             if (!IsClientProcess(proc))
             {
-                lock (_sync) { _knownWindows.Add(hwnd); }
+                lock (_sync) { RememberWindow(hwnd); }
                 return false;
             }
 
@@ -1458,7 +1482,7 @@ namespace LolFocusGuard
             lock (_sync)
             {
                 if (_knownWindows.Contains(hwnd)) return false;
-                _knownWindows.Add(hwnd);
+                RememberWindow(hwnd);
                 // 这个进程已经放行过一次了 → 之后它的任何新窗口都不算"第一次出现"
                 if (pid != 0 && !_knownPids.Add(pid)) return false;
             }
@@ -1466,6 +1490,27 @@ namespace LolFocusGuard
             int ageSec = ClientProcessAgeSeconds(pid);
             if (ageSec < 0) return true;      // 拿不到启动时间：退化为"只按 pid 一次"
             return ageSec <= FIRST_CLIENT_WINDOW_SECONDS;
+        }
+
+        /// <summary>
+        /// 记住"这个窗口见过了"，并维持上限：客户端窗口增删频繁时 _knownWindows 会慢慢涨，
+        /// 超了就按插入顺序丢掉最旧的一批（不要求精确 LRU —— 丢早了只是可能把老窗口
+        /// 重新当成"第一次出现"，而"每 pid 只放行一次"已经把这条兜住了）。
+        /// **调用方必须持有 _sync。**
+        /// </summary>
+        private void RememberWindow(IntPtr hwnd)
+        {
+            if (!_knownWindows.Add(hwnd)) return;
+            _knownWindowOrder.Enqueue(hwnd);
+            if (_knownWindowOrder.Count > KNOWN_WINDOWS_MAX)
+            {
+                int drop = KNOWN_WINDOWS_MAX / 4;
+                for (int i = 0; i < drop; i++)
+                {
+                    IntPtr old = _knownWindowOrder.Dequeue();
+                    _knownWindows.Remove(old);
+                }
+            }
         }
 
         /// <summary>客户端进程已经跑了多少秒；拿不到（没权限/进程已退出）返回 -1。</summary>
@@ -1476,6 +1521,8 @@ namespace LolFocusGuard
             {
                 using (Process p = Process.GetProcessById(pid))
                 {
+                    // 这里用 DateTime 是对的：进程启动时间是**墙上时钟**的绝对时刻，
+                    // 和单调时钟没有可比性；而且只用来判断"是不是刚起来"，误差几秒无所谓。
                     double sec = (DateTime.Now - p.StartTime).TotalSeconds;
                     if (sec < 0 || sec > int.MaxValue) return -1;
                     return (int)sec;
@@ -1518,7 +1565,7 @@ namespace LolFocusGuard
                             string cls = ClassUnderPoint(info.pt);
                             _lastClickWhere = proc;
                             _lastClickClass = cls;
-                            _lastClickAt = DateTime.Now;
+                            _lastClickAt = Clock.NowMs();
                             _hookClickCount++;
                         }
                     }
@@ -1526,7 +1573,7 @@ namespace LolFocusGuard
                     {
                         _lastInputWhere = string.Empty;
                     }
-                    _lastInputAt = DateTime.Now;
+                    _lastInputAt = Clock.NowMs();
                     _inputCount++; // 钩子回调里不写日志（会拖慢输入），只计数，由心跳线程输出
                 }
             }
@@ -1544,10 +1591,10 @@ namespace LolFocusGuard
                         Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
                     if (msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN)
                     {
-                        _lastInputAt = DateTime.Now;
+                        _lastInputAt = Clock.NowMs();
                         if (info.vkCode == 0x12 || info.vkCode == 0x5B || info.vkCode == 0x5C) // Alt / Win
                         {
-                            _lastModifierAt = DateTime.Now;
+                            _lastModifierAt = Clock.NowMs();
                         }
                     }
                 }
@@ -1563,11 +1610,13 @@ namespace LolFocusGuard
         {
             lock (_sync)
             {
-                DateTime until;
-                if (_suppressedUntil.TryGetValue(hwnd, out until))
+                long from;
+                if (_suppressedFrom.TryGetValue(hwnd, out from))
                 {
-                    if (DateTime.Now < until) return true;
-                    _suppressedUntil.Remove(hwnd);
+                    // 存的是"从什么时候开始放弃"，不是"放弃到几点"：
+                    // 判定只算差值，系统时钟往回拨也不会变成无限期放弃。
+                    if (Clock.AgeMs(from) < SUPPRESS_MS) return true;
+                    _suppressedFrom.Remove(hwnd);
                 }
             }
             return false;
@@ -1576,7 +1625,7 @@ namespace LolFocusGuard
         private string ClickTargetProc()
         {
             if (_noClickAllow) return string.Empty;
-            if ((DateTime.Now - _lastInputAt).TotalMilliseconds < 250) return _lastInputWhere;
+            if (Clock.AgeMs(_lastInputAt) < 250) return _lastInputWhere;
             return string.Empty;
         }
 
@@ -1586,13 +1635,13 @@ namespace LolFocusGuard
         /// </summary>
         private void Block(IntPtr hwnd)
         {
-            DateTime now = DateTime.Now;
-            if ((now - _lastBlockRequestAt).TotalMilliseconds < 80) return; // 防重入抖动
+            long now = Clock.NowMs();
+            if (Clock.AgeMs(_lastBlockRequestAt) < 80) return; // 防重入抖动
             _lastBlockRequestAt = now;
             // 先取旧值再更新：escalating 要算的正是"上一次拦截到现在隔了多久"。
             // 之前是先 _lastBlockAt = now 再取，差值恒为 0，于是任何窗口被拦过第二次就永远
             // 被当成"连续弹"（而且 _lastBlockedHwnd 永不复位），一直走最强硬的最小化路径。
-            DateTime previousBlockAt = _lastBlockAt;
+            long previousBlockAt = _lastBlockAt;
             _lastBlockAt = now;
 
             int number = ++_blockCount;
@@ -1600,7 +1649,7 @@ namespace LolFocusGuard
             // 同一窗口在 2 秒内又来抢前台 → 说明只把焦点还回去不够（它自己还会再弹），
             // 直接最小化掉，别跟它来回拉锯。
             bool escalating = (hwnd == _lastBlockedHwnd) &&
-                              (now - previousBlockAt).TotalMilliseconds < 2000;
+                              Clock.AgeMs(previousBlockAt) < 2000;
             _lastBlockedHwnd = hwnd;
 
             bool wasMinimized = escalating || IsRecentlyIconic(hwnd, 5) ||
@@ -1708,16 +1757,16 @@ namespace LolFocusGuard
                 {
                     _blockFailHwnd = IntPtr.Zero;
                     _blockFailCount = 0;
-                    _blockFailAt = DateTime.MinValue;
+                    _blockFailAt = Clock.Never;
                 }
                 return;
             }
 
             bool giveUp = false;
-            DateTime now = DateTime.Now;
+            long now = Clock.NowMs();
             lock (_sync)
             {
-                if (hwnd != _blockFailHwnd || (now - _blockFailAt).TotalSeconds > 10)
+                if (hwnd != _blockFailHwnd || Clock.AgeMs(_blockFailAt) > 10000)
                 {
                     _blockFailHwnd = hwnd;
                     _blockFailAt = now;
@@ -1726,9 +1775,10 @@ namespace LolFocusGuard
                 _blockFailCount++;
                 if (_blockFailCount >= 5)
                 {
-                    _suppressedUntil[hwnd] = now.AddSeconds(15);
+                    // 放弃拦截只记"从什么时候开始"，时长由 SUPPRESS_MS 决定（见 IsSuppressed）
+                    _suppressedFrom[hwnd] = now;
                     _blockFailCount = 0;
-                    _blockFailAt = DateTime.MinValue;
+                    _blockFailAt = Clock.Never;
                     _blockFailHwnd = IntPtr.Zero;
                     giveUp = true;
                 }
@@ -1871,14 +1921,68 @@ namespace LolFocusGuard
             }
         }
 
+        /// <summary>
+        /// 记一行日志。**只入队，不碰磁盘** —— 它会被 WinEvent 回调线程、钩子线程、动作线程调用，
+        /// 同步 AppendAllText 在 Defender 扫盘时能把系统回调拖住几十毫秒。
+        /// 行格式保持 `[yyyy-MM-dd HH:mm:ss.fff] 内容` 不变（测试脚本按这个前缀做正则）。
+        /// </summary>
         public void Log(string message)
         {
-            string line = string.Format("[{0:yyyy-MM-dd HH:mm:ss.fff}] {1}", DateTime.Now, message);
+            try
+            {
+                if (_logQueue.Count >= LOG_QUEUE_MAX)
+                {
+                    _logDropped++;
+                    return;
+                }
+                string line = string.Format("[{0:yyyy-MM-dd HH:mm:ss.fff}] {1}", DateTime.Now, message);
+                _logQueue.Enqueue(line);
+                if (_logQueue.Count >= LOG_FLUSH_LINES) _logSignal.Set();
+            }
+            catch
+            {
+                // 日志写不进去不影响功能
+            }
+        }
+
+        /// <summary>后台落盘线程：每 200ms 或攒够 64 行批量写一次；退出时把剩下的写完。</summary>
+        private void LogWriterLoop()
+        {
+            while (!_disposed || !_logQueue.IsEmpty)
+            {
+                try
+                {
+                    _logSignal.WaitOne(LOG_FLUSH_INTERVAL_MS);
+                    FlushLog();
+                }
+                catch
+                {
+                    // 写盘失败不能拖死线程
+                }
+            }
+            FlushLog();
+        }
+
+        /// <summary>把队列里现有的行一次性写进文件。只有后台线程和 Dispose 会调。</summary>
+        private void FlushLog()
+        {
+            if (_logQueue.IsEmpty) return;
+
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(4096);
+            string line;
+            while (_logQueue.TryDequeue(out line))
+            {
+                sb.Append(line).Append(Environment.NewLine);
+            }
+            if (sb.Length == 0) return;
+
             try
             {
                 lock (_logLock)
                 {
-                    File.AppendAllText(_logPath, line + Environment.NewLine, Encoding.UTF8);
+                    // 还是用 AppendAllText：行为和原来逐行写完全一致（含首次写文件时的 UTF-8 BOM），
+                    // 只是现在一次写一批。
+                    File.AppendAllText(_logPath, sb.ToString(), Encoding.UTF8);
                 }
             }
             catch
@@ -1911,6 +2015,67 @@ namespace LolFocusGuard
             }
             _disposed = true;
             Log("守卫退出");
+            // 异步日志：等后台线程把最后一批写完（最多 500ms，超时也自己再刷一次，
+            // 保证"最后一行"不会丢 —— 退出这条日志是排查问题时最需要的那条）。
+            _logSignal.Set();
+            try { _logThread.Join(500); }
+            catch { }
+            FlushLog();
+            if (_logDropped > 0)
+            {
+                // 只在真的丢过行时提示一次（写到"退出"之后，不再入队）
+                try
+                {
+                    lock (_logLock)
+                    {
+                        File.AppendAllText(_logPath,
+                            string.Format("[{0:yyyy-MM-dd HH:mm:ss.fff}] 提示：日志积压丢弃了 {1} 行（磁盘太慢）",
+                                DateTime.Now, _logDropped) + Environment.NewLine,
+                            Encoding.UTF8);
+                    }
+                }
+                catch { }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 单调时钟（毫秒）。存在的唯一理由：**不能用 DateTime.Now 算时间差**。
+    ///
+    /// 系统时钟被 NTP 校正、手动改时间、夏令时往回拨时，`DateTime.Now - _lastClickAt` 会变成负数，
+    /// 于是 `ClickAgeMs > 350` 不成立 → "最近没按过键"这个判据永远不成立 → **守卫永久放行**；
+    /// 同理"放弃拦截到几点"会变成无限期。这类 bug 只在改时间的那一刻出现，极难复现。
+    ///
+    /// Environment.TickCount 是开机以来的毫秒数，单调、只看差值、不受墙上时钟影响。
+    /// 它是 32 位有符号、约 49.7 天回绕一次，所以统一转成 uint 语义的 long 存，
+    /// 差值一律用 `unchecked((uint)(now - then))` 算 —— 只要间隔远小于 49.7 天就永远正确。
+    /// 日志和界面上"几点几分"仍然用 DateTime.Now（只用于显示）。
+    /// </summary>
+    internal static class Clock
+    {
+        /// <summary>"从没发生过"的哨兵值（比任何真实 tick 都小）。</summary>
+        public const long Never = -1;
+
+        public static long NowMs()
+        {
+            return unchecked((uint)Environment.TickCount);
+        }
+
+        /// <summary>距今多少毫秒（回绕安全，结果永远 &gt;= 0）。Never 返回 double.MaxValue。</summary>
+        public static double AgeMs(long thenMs)
+        {
+            if (thenMs < 0) return double.MaxValue;
+            uint delta = unchecked((uint)((uint)Environment.TickCount - (uint)thenMs));
+            // 超过 24.8 天只可能是"then 其实在未来"或真的隔了那么久：
+            // 一律当"很久以前"，绝不返回负数（负数会让"350ms 内按过键"永远成立）。
+            if (delta > 0x7FFFFFFFu) return double.MaxValue;
+            return delta;
+        }
+
+        /// <summary>距今是否在 ms 毫秒之内。Never 恒为 false。</summary>
+        public static bool Within(long thenMs, double ms)
+        {
+            return AgeMs(thenMs) <= ms;
         }
     }
 
