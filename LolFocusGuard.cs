@@ -59,6 +59,9 @@ namespace LolFocusGuard
         [DllImport("user32.dll")]
         public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
 
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetParent(IntPtr hWnd);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
 
@@ -475,11 +478,11 @@ namespace LolFocusGuard
                     // （慢客户端尤其明显），这时重试会以 retry=true 跑 ProcessForeground，
                     // 而 retry 分支强制忽略点击证据 → 把你正要打开的窗口又压回去。
                     // 所以判据是「这次拦截**之后**你有没有按过鼠标/Alt/Win」，而不是「最近有没有输入」；
-                    // 并且按下的落点得像个切换动作（任务栏，或目标进程的窗口）。
+                    // 并且按下的落点得像个切换动作（shell 的点击入口，或目标进程的窗口）。
                     bool userTakingOver =
                         (_lastClickAt > _pendingBlockAt &&
                          (DateTime.Now - _lastClickAt).TotalMilliseconds <= SHELL_CLICK_GRACE_MS &&
-                         (IsTaskbarClass(_lastClickClass) || _targets.Contains(_lastClickWhere))) ||
+                         (IsShellClickClass(_lastClickClass) || _targets.Contains(_lastClickWhere))) ||
                         (_lastModifierAt > _pendingBlockAt);
 
                     if (_paused || _lastAllowAt > _pendingBlockAt || userTakingOver)
@@ -497,7 +500,7 @@ namespace LolFocusGuard
                 {
                     Log(string.Format("心跳 fg={0} 按键={1} 钩子输入={2}次 钩子最后输入={3}ms前({4})",
                         ProcNameOf(fg),
-                        _lastClickAt == DateTime.MinValue ? "没按过" : string.Format("{0:0}ms前@{1}", (DateTime.Now - _lastClickAt).TotalMilliseconds, _lastClickWhere.Length > 0 ? _lastClickWhere : "?"),
+                        _lastClickAt == DateTime.MinValue ? "没按过或已用掉" : string.Format("{0:0}ms前@{1}", (DateTime.Now - _lastClickAt).TotalMilliseconds, _lastClickWhere.Length > 0 ? _lastClickWhere : "?"),
                         _inputCount,
                         _inputAgeMs,
                         _lastInputWhere.Length > 0 ? _lastInputWhere : "-"));
@@ -629,30 +632,81 @@ namespace LolFocusGuard
 
         private static bool IsShellProcess(string proc) { return ProcClass.IsShell(proc); }
 
-        /// <summary>鼠标指针下面那个窗口的类名（用来区分「任务栏」和「资源管理器文件夹窗口」）。</summary>
+        /// <summary>
+        /// Windows 的"点击入口"窗口类。点这些地方都属于"你自己在切窗口/唤起程序"，
+        /// 不能判成"按在别处"。分两类：
+        ///   · 任务栏本身（Shell_TrayWnd / Shell_SecondaryTrayWnd）→ 享受 2.5 秒长宽限
+        ///     （从按下到窗口真正激活可能要几百毫秒，客户端从最小化恢复尤其慢）；
+        ///   · 其它入口（托盘溢出面板、开始菜单、任务视图、任务栏缩略图预览）→ 本身是顶层窗口，
+        ///     激活很快，只按常规 350ms 算。
+        /// 注意：资源管理器的**文件夹窗口**（CabinetWClass）不在这个名单里 ——
+        /// 它同属 explorer.exe，但点它并不意味着你要切到客户端，否则客户端自弹会搭这趟顺风车。
+        /// </summary>
+        private static readonly string[] ShellClickClasses = new string[]
+        {
+            "Shell_TrayWnd",                       // 主屏任务栏
+            "Shell_SecondaryTrayWnd",              // 副屏任务栏
+            "TaskListThumbnailWnd",                // 任务栏缩略图预览（点它=切到那个窗口）
+            "NotifyIconOverflowWindow",            // Win10 托盘溢出面板（本身就是顶层窗口）
+            "TopLevelWindowForOverflowXamlIsland", // Win11 托盘溢出面板
+            "Windows.UI.Core.CoreWindow",          // 开始菜单 / 通知中心（StartMenuExperienceHost · ShellExperienceHost）
+            "MultitaskingViewFrame",               // 任务视图（Win10）
+            "XamlExplorerHostIslandWindow"         // 任务视图 / 虚拟桌面（Win11）
+        };
+
+        /// <summary>
+        /// 鼠标指针下面那个窗口的类名（用来区分「任务栏/托盘/开始菜单」和「资源管理器文件夹窗口」）。
+        ///
+        /// WindowFromPoint 命中的往往是容器里的子窗口（Start / TrayNotifyWnd / MSTaskSwWClass…），
+        /// 所以必须沿 GetParent 逐级向上找。**不能用 GetAncestor(GA_ROOT)**：它一步就到顶层，
+        /// 循环等于没转；而且托盘溢出面板、开始菜单、任务视图这些入口**本身就是顶层窗口**，
+        /// 类名不在任务栏那一层，用 GA_ROOT 会把它们全当成"按在别处"→ 把用户要打开的窗口最小化。
+        /// </summary>
         private static string ClassUnderCursor()
         {
             Native.POINT pt;
             if (!Native.GetCursorPos(out pt)) return string.Empty;
-            IntPtr under = Native.WindowFromPoint(pt);
-            if (under == IntPtr.Zero) return string.Empty;
-            // 任务栏是个容器：WindowFromPoint 命中的往往是里面的子窗口
-            // （Start / TrayNotifyWnd / MSTaskSwWClass…），往上找顶层窗口再取类名。
-            IntPtr h = under;
-            for (int i = 0; i < 4 && h != IntPtr.Zero; i++)
+            IntPtr h = Native.WindowFromPoint(pt);
+            if (h == IntPtr.Zero) return string.Empty;
+
+            string hit = ClassNameOf(h);
+            string firstShellEntry = string.Empty;
+            IntPtr cur = h;
+            for (int i = 0; i < 8 && cur != IntPtr.Zero; i++)
             {
-                string cls = ClassNameOf(h);
+                string cls = ClassNameOf(cur);
+                // 任务栏优先：缩略图预览、跳转列表这些是任务栏的子窗口/弹层，
+                // 在链上能找到 Shell_TrayWnd 就该按任务栏算（长宽限）。
                 if (IsTaskbarClass(cls)) return cls;
-                h = Native.GetAncestor(h, Native.GA_ROOT);
+                if (firstShellEntry.Length == 0 && IsShellClickClass(cls)) firstShellEntry = cls;
+                IntPtr parent = Native.GetParent(cur);
+                if (parent == cur || parent == IntPtr.Zero) break;
+                cur = parent;
             }
-            return ClassNameOf(under);
+            return firstShellEntry.Length > 0 ? firstShellEntry : hit;
         }
 
-        /// <summary>任务栏（主屏/副屏）。只有点它才享受"激活可能很慢"的长宽限。</summary>
+        /// <summary>
+        /// 任务栏（主屏/副屏/任务栏缩略图预览）。只有它们才享受"激活可能很慢"的长宽限。
+        /// 缩略图预览（TaskListThumbnailWnd）是"点任务栏上那个小预览把最小化窗口叫回来"，
+        /// 和任务栏一样是从最小化恢复，激活可能要几百毫秒 —— 按 350ms 算会误拦用户。
+        /// </summary>
         private static bool IsTaskbarClass(string cls)
         {
             return string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
-                   string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase);
+                   string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(cls, "TaskListThumbnailWnd", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>这是不是 shell 的"点击入口"（任务栏 / 托盘溢出 / 开始菜单 / 任务视图 / 缩略图预览）。</summary>
+        private static bool IsShellClickClass(string cls)
+        {
+            if (cls == null || cls.Length == 0) return false;
+            for (int i = 0; i < ShellClickClasses.Length; i++)
+            {
+                if (string.Equals(cls, ShellClickClasses[i], StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
         }
 
         // ---------- LCU 登录状态（只在本机 127.0.0.1 上调客户端自己的接口，不注入） ----------
@@ -1032,6 +1086,35 @@ namespace LolFocusGuard
             return name;
         }
 
+        /// <summary>
+        /// 这一次前台变化如果是「那一下点击」引起的，就把点击证据消费掉（用一次就没了）。
+        ///
+        /// 为什么"非目标窗口"那条路也必须调用：你点任务栏切到浏览器/别的程序时，
+        /// ProcessForeground 在 isTarget=false 那里就 return 了；如果那儿不消费，2.5 秒内
+        /// 客户端自弹仍然会被判成"你点的" —— 这正是 P1-8 要砍的顺风车。
+        ///
+        /// 调用方必须已持有 _sync（和 ProcessForeground 同一个临界区）。
+        /// </summary>
+        private void ConsumeClickEvidenceIfUsed()
+        {
+            DateTime usedClickAt = _lastClickAt;
+            if (usedClickAt == DateTime.MinValue) return;
+
+            double age = (DateTime.Now - usedClickAt).TotalMilliseconds;
+            string where = _lastClickWhere;
+            bool shellClick = IsShellProcess(where) && IsShellClickClass(_lastClickClass) &&
+                              age <= SHELL_CLICK_GRACE_MS;
+            bool clickOnTarget = _targets.Contains(where) && age <= CLICK_GRACE_MS;
+            if (!shellClick && !clickOnTarget) return;
+
+            // 只消费"刚刚判定用的那一份"：用户在这中间新按的一下不能被吃掉。
+            if (_lastClickAt != usedClickAt) return;
+
+            _lastClickAt = DateTime.MinValue; // 证据用掉
+            _lastClickWhere = string.Empty;
+            _lastClickClass = string.Empty;
+        }
+
         /// <param name="retry">
         /// true = "目标窗口赖在前台不动，再过一遍"的重试。重试时窗口已经在最前面了，
         /// 指针多半就压在它身上，所以绝不能把「指针在它上面」当成你点的。
@@ -1064,7 +1147,7 @@ namespace LolFocusGuard
                         proc, ProcIdOf(hwnd), ClassNameOf(hwnd), TitleOf(hwnd), size,
                         Native.IsIconic(hwnd),
                         _lastClickAt == DateTime.MinValue
-                            ? "没按过"
+                            ? "没按过或已用掉"
                             : string.Format("{0:0}ms前@{1}", (DateTime.Now - _lastClickAt).TotalMilliseconds,
                                 _lastClickWhere.Length > 0 ? _lastClickWhere : "?")));
                 }
@@ -1077,6 +1160,10 @@ namespace LolFocusGuard
                     {
                         _lastForeground = hwnd;
                     }
+                    // 这一次前台变化如果是那一下点击引起的（比如点任务栏切到浏览器），
+                    // 这份点击证据同样算"用掉了"。否则 2.5 秒内客户端自弹会搭这趟顺风车：
+                    // 你点了任务栏去切浏览器，2 秒后客户端自己弹前台，还被判成"你点的"。
+                    ConsumeClickEvidenceIfUsed();
                     return;
                 }
 
@@ -1110,17 +1197,24 @@ namespace LolFocusGuard
                 facts.ModifierIdleMs = (DateTime.Now - _lastModifierAt).TotalMilliseconds;
                 // 「你手动切窗口」的硬证据：鼠标物理按键真的按下了（ClickWatchLoop 每 15ms 采一次），
                 // 以及按下那一刻指针落在谁身上。它自己抢前台的时候一个按键都没有，这条能把两者分开。
-                facts.ClickAgeMs = (DateTime.Now - _lastClickAt).TotalMilliseconds;
+                // 记下本次判定用的那一份点击证据（下面"用完即弃"要确认消费的还是同一份，
+                // 不能把用户在这中间新按的一下吃掉）。
+                DateTime usedClickAt = _lastClickAt;
+                facts.ClickAgeMs = (DateTime.Now - usedClickAt).TotalMilliseconds;
                 // 重试轮里窗口已经在最前面、指针必然压着它 —— 那一轮不能把"指针在它上面"算成你点的
                 string where = _lastClickWhere;
                 facts.ClickOnTarget = !retry && _targets.Contains(where);
-                // 点任务栏：从按下到窗口真正被激活往往要几百毫秒（客户端从最小化恢复尤其慢），
-                // 所以任务栏这一路单独给 2.5 秒宽限，否则「点任务栏把它叫出来」会被当场判成自弹。
-                // 但只认"真的点在任务栏上"（Shell_TrayWnd / Shell_SecondaryTrayWnd）：点资源管理器
-                // 的文件夹窗口、桌面图标也是 explorer 进程，那不能算"你要切到客户端"，
-                // 否则客户端自弹会搭这趟顺风车漏过去。
-                bool clickOnTaskbar = IsShellProcess(where) && IsTaskbarClass(_lastClickClass);
-                facts.ClickOnShell = !retry && clickOnTaskbar && facts.ClickAgeMs <= SHELL_CLICK_GRACE_MS;
+                // 点任务栏 / 托盘溢出 / 开始菜单 / 任务视图 / 缩略图预览：
+                //   · 任务栏本身给 2.5 秒宽限（从按下到窗口真正被激活往往要几百毫秒，
+                //     客户端从最小化恢复尤其慢），否则「点任务栏把它叫出来」会被当场判成自弹；
+                //   · 其它入口（本身就是顶层窗口，激活很快）只按常规 350ms 算。
+                // 两者都要求指针下面是 shell 进程，且类名在 ShellClickClasses 白名单里 ——
+                // 资源管理器的文件夹窗口、桌面图标同属 explorer，但不是"点击入口"，
+                // 那不算"你要切到客户端"，否则客户端自弹会搭这趟顺风车漏过去。
+                bool shellEntry = IsShellProcess(where) && IsShellClickClass(_lastClickClass);
+                bool clickOnTaskbar = shellEntry && IsTaskbarClass(_lastClickClass);
+                double shellGraceMs = clickOnTaskbar ? SHELL_CLICK_GRACE_MS : FocusRules.ClickGraceMs;
+                facts.ClickOnShell = !retry && shellEntry && facts.ClickAgeMs <= shellGraceMs;
                 if (facts.ClickOnShell) facts.ClickAgeMs = Math.Min(facts.ClickAgeMs, FocusRules.ClickGraceMs);
                 facts.PrevWindowGone = _lastForeground != IntPtr.Zero && _lastForeground != hwnd &&
                                        !Native.IsWindow(_lastForeground);
@@ -1163,6 +1257,16 @@ namespace LolFocusGuard
                             _blockFailCount = 0;
                             _blockFailAt = DateTime.MinValue;
                         }
+                    }
+
+                    // 点击证据「用完即弃」：这次前台变化就是那一次点击引起的，同一份证据不能再
+                    // 放行后面任何一次自弹。否则"点任务栏切到浏览器 → 2 秒后客户端自弹"会搭这趟
+                    // 顺风车（2.5 秒的宽限本来是给"激活慢"的，不该变成"2.5 秒内随便弹都放行"）。
+                    // 误拦的风险由上面刷新过的"同一个 hwnd 3 秒保护"兜底（那条不受影响）。
+                    if (decision.Code == DecisionCode.AllowClickedTarget ||
+                        decision.Code == DecisionCode.AllowClickedShell)
+                    {
+                        ConsumeClickEvidenceIfUsed();
                     }
                     return;
                 }
@@ -1224,7 +1328,7 @@ namespace LolFocusGuard
                     if (_verbose)
                     {
                         Log(_lastClickAt == DateTime.MinValue
-                            ? "不放行: 鼠标一次都没按过（它是自己弹的）"
+                            ? "不放行: 没有尚未用掉的鼠标按键（它是自己弹的）"
                             : string.Format("不放行: {0:0}ms 内没有鼠标按键按下（它是自己弹的）",
                                 (DateTime.Now - _lastClickAt).TotalMilliseconds));
                     }
