@@ -244,6 +244,11 @@ namespace LolFocusGuard
         private long _pauseStartedAtMs = Clock.Never;
         private long _pauseDurationMs;
         private int _blockCount;
+        // 客户端这一轮启动时的累计拦截数，用来算"本轮拦了几次"（客户端退出时打一行小结）
+        private int _blockCountAtClientStart;
+        // 守卫启动时刻 + 上一次"我还在跑"心跳的时刻（每 30 分钟一行，证明长局里没半路退出）
+        private long _startedAtMs = Clock.NowMs();
+        private long _lastAliveLogAt = Clock.NowMs();
         // 每个目标窗口"上一次处于最小化"的时间，用来判断弹出来的那一刻它是不是从最小化状态恢复的
         private readonly Dictionary<IntPtr, long> _iconicAt = new Dictionary<IntPtr, long>();
         private readonly List<int> _targetPids = new List<int>();
@@ -515,6 +520,15 @@ namespace LolFocusGuard
                 // 每 4 个 tick 扫一遍目标进程的窗口，记下谁现在是最小化的
                 if ((_scanTick++ % 4) == 0) ScanIconic();
                 if ((_scanTick % 20) == 0) RefreshClientRunning();
+                // 每 30 分钟留一行"我还活着"：长局/挂机几小时后，日志里能证明守卫一直在跑，
+                // 而不是半路退出（不然"没拦"到底是不该拦还是根本没在跑就分不清了）。
+                if (Clock.AgeMs(_lastAliveLogAt) > 30 * 60 * 1000)
+                {
+                    _lastAliveLogAt = Clock.NowMs();
+                    Log(string.Format("仍在运行（已运行 {0:0} 分钟，累计拦截 {1} 次，客户端{2}）",
+                        Clock.AgeMs(_startedAtMs) / 60000.0, _blockCount,
+                        _clientRunning ? "在运行" : "没运行"));
+                }
                 if ((_scanTick % 40) == 0)
                 {
                     try
@@ -850,6 +864,7 @@ namespace LolFocusGuard
                 {
                 }
             }
+            bool wasRunning = _clientRunning;
             _clientRunning = running;
             // 客户端（含启动器）全都退出了 → "每个 pid 只放行一次"的记录清零，
             // 否则下次客户端重启后万一被系统复用同一个 pid，登录页就再也放行不了了。
@@ -858,6 +873,23 @@ namespace LolFocusGuard
                 lock (_sync)
                 {
                     if (_knownPids.Count > 0) _knownPids.Clear();
+                }
+            }
+            // 每局前后的分段小结：不打日志的话，用户玩完只能看"拦截 #N"从几跳到几，
+            // 自己猜这一局拦了多少。这两行让日志能直接对上"客户端什么时候起、什么时候退、
+            // 这一轮拦了几次"，也是"守卫那时候到底还活着吗"的证据。
+            if (running != wasRunning)
+            {
+                if (running)
+                {
+                    _blockCountAtClientStart = _blockCount;
+                    Log("监测到客户端/WeGame 已启动：从现在开始盯前台（历史累计拦截 " + _blockCount + " 次）");
+                }
+                else
+                {
+                    Log("客户端/WeGame 已全部退出：本轮拦截 " + (_blockCount - _blockCountAtClientStart) +
+                        " 次（历史累计 " + _blockCount + " 次）");
+                    _blockCountAtClientStart = _blockCount;
                 }
             }
         }
