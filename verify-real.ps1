@@ -68,6 +68,17 @@ $switchEvents = 0
 # 只能按窗口身份认 —— 这两个数就是那条通道到底有没有在用的证据。
 $switcherSeen = 0
 $credAllow = 0
+# "按住"（打回后 300ms 内反复压）：命中次数 + 累计压回去的次数。
+# 这是"对局就绪"那种被打回后几十毫秒又顶回来的场景到底有没有被压住的直接证据。
+$holdRounds = 0
+$holdPushes = 0
+# 打回时窗口带着模态弹窗（IsWindowEnabled=False）的次数 —— 这类现在只抢前台、不最小化，
+# 出现这个数说明你打游戏的时候客户端确实弹过"接受对局"之类的东西。
+$freeModal = 0
+# WeGame 启动流程宽限（客户端刚起来 20 秒内放行 WeGame 自己的窗口）
+$launchGrace = 0
+# "放弃拦截期"（10 秒内连续 5 次压不下去 → 15 秒不设防）：唯一会主动不设防的情况
+$suppressEnters = 0
 # 只有"你在操作"的放行才参与复发配对。抑制期（正在放弃拦截期）、刚放行过这个窗口、刚解锁
 # 这些不是用户意图：拿它们配对必然误报 —— 抑制期一结束它再弹就被拦，间隔往往 <1.2 秒，
 # 结果被算成"你刚把它叫出来又被压回去"，而用户根本没叫过它。
@@ -140,6 +151,15 @@ foreach ($raw in $all) {
         continue
     }
     if ($line -match '放弃拦截 15 秒') { $giveUp++; continue }
+    # 新增机制的证据行（守卫 b9db24c / e132534 / 0c50c26）
+    if ($line -match '按住：它又抢了 (\d+) 次前台') {
+        $holdRounds++
+        $holdPushes += [int]$Matches[1]
+        continue
+    }
+    if ($line -match '带着模态弹窗|模态窗口只抢前台不最小化') { $freeModal++; continue }
+    if ($line -match 'WeGame 启动流程') { $launchGrace++; continue }
+    if ($line -match '正在放弃拦截期') { $suppressEnters++; continue }
     if ($line -match '取消拦截（请求 #\d+）：(.+)$') {
         $cancel++
         $why = $Matches[1]
@@ -266,6 +286,18 @@ if ($autoOther -gt 0) {
 if ($heartbeats -gt 0) { "心跳行: $heartbeats 行（说明这局是 --verbose 跑的；切换器事件累计=$switchEvents）" }
 if ($switcherSeen -gt 0 -or $credAllow -gt 0) {
     "任务切换器认出 $switcherSeen 次；靠一次性切换凭据放行 $credAllow 次（Alt+Tab/任务视图切到客户端、它慢半拍才画出来时，走的就是这条）"
+}
+if ($holdRounds -gt 0) {
+    "按住生效 $holdRounds 次，累计把「又顶回前台」压回去 $holdPushes 次（$([math]::Round($holdPushes / $holdRounds, 1)) 次/轮）——它就是被压住的，不是被放过的"
+}
+if ($freeModal -gt 0) {
+    "打回时窗口带着模态弹窗 $freeModal 次 —— 这些按新规则只抢前台、不最小化，不会藏进任务栏（你要接受随时点任务栏/Alt+Tab）"
+}
+if ($launchGrace -gt 0) {
+    "WeGame 启动流程宽限放行 $launchGrace 次（客户端刚起来 20 秒内，WeGame 自己的窗口不算自弹）"
+}
+if ($suppressEnters -gt 0) {
+    "! 进入「放弃拦截期」$suppressEnters 次（10 秒内连续 5 次压不下去 → 15 秒不设防）：这是唯一会主动不设防的情况，看你当时在做什么"
 }
 if ($diagModal -gt 0 -or $diagFgNotRestored -gt 0 -or $diagOther -gt 0) {
     ''
