@@ -13,6 +13,16 @@ namespace LolFocusGuard
         /// <summary>被切到前台的窗口是 WeGame，而且客户端进程还没起来（国服登录阶段）。</summary>
         public bool WeGameLoginPhase;
 
+        /// <summary>
+        /// 客户端进程刚起来的一小段时间里（`WeGameLaunchGraceMs`），WeGame 自己的窗口递上来
+        /// 算**启动流程的一部分**，不算它自弹。
+        ///
+        /// 为什么需要：真机日志（21:54:42）你刚在 WeGame 里点启动 LoL，客户端进程一起来，
+        /// `_clientRunning` 变 true，于是 WeGame 的 TWINCONTROL 窗口立刻被当成"自弹"打了两次回去
+        /// —— 你正在用它启动游戏，它被缩掉就是纯干扰。
+        /// </summary>
+        public bool WeGameLaunchGrace;
+
         /// <summary>被切到前台的窗口是客户端进程的窗口，且是第一次见到。</summary>
         public bool FirstClientWindow;
 
@@ -77,6 +87,7 @@ namespace LolFocusGuard
     internal enum DecisionCode
     {
         AllowWeGameLogin,
+        AllowWeGameLaunch,
         AllowFirstClientWindow,
         AllowSuppressed,
         AllowJustUnlocked,
@@ -108,6 +119,9 @@ namespace LolFocusGuard
     internal static class FocusRules
     {
         public const int ModifierGraceMs = 1500;
+
+        /// <summary>客户端进程刚起来之后，WeGame 窗口的"启动流程"宽限。</summary>
+        public const int WeGameLaunchGraceMs = 20000;
         public const int ClickGraceMs = 350;   // 按键按下后多久内算"这次切换是你点的"
         public const int SwitchEndGraceMs = 2500; // Alt+Tab 切换器关掉后多久内还算"你切的"
 
@@ -124,6 +138,11 @@ namespace LolFocusGuard
 
             // 1) 国服登录阶段：客户端还没起来，WeGame 的窗口全放行
             if (f.WeGameLoginPhase) return new Decision(true, DecisionCode.AllowWeGameLogin);
+
+            // 1.5) 刚启动客户端那 20 秒：WeGame 把窗口递上来是启动流程的一部分。
+            //      真机上你点"启动游戏"后客户端进程一起来，WeGame 的窗口就上前台，
+            //      按"自弹"打回去等于干扰你启动，所以这段给放行。
+            if (f.WeGameLaunchGrace) return new Decision(true, DecisionCode.AllowWeGameLaunch);
 
             // 2) 客户端窗口第一次出现（登录页 / 启动页 / 安全检测）
             if (f.FirstClientWindow) return new Decision(true, DecisionCode.AllowFirstClientWindow);

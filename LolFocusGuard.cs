@@ -310,6 +310,9 @@ namespace LolFocusGuard
         private bool _loginStateLogged;
         private string _lcuLockfile;
         private volatile bool _clientRunning;
+
+        // 客户端进程"这一轮"是什么时候起来的（用于 WeGame 启动流程的 20 秒宽限）
+        private long _clientStartedAt = Clock.Never;
         private long _clientCheckAt = Clock.Never;
         private long _lastWegameAllowLogAt = Clock.Never;
         // 已经见过的目标窗口（只放过"第一次出现"的窗口）。
@@ -948,6 +951,7 @@ namespace LolFocusGuard
             }
             bool wasRunning = _clientRunning;
             _clientRunning = running;
+            if (running && !wasRunning) _clientStartedAt = Clock.NowMs();
             // 客户端（含启动器）全都退出了 → "每个 pid 只放行一次"的记录清零，
             // 否则下次客户端重启后万一被系统复用同一个 pid，登录页就再也放行不了了。
             if (!running)
@@ -1441,6 +1445,10 @@ namespace LolFocusGuard
                 // WeGame 的窗口一律放行，不然用户连登录都点不了；
                 // 客户端已经起来之后再冒出来的（"游戏进程已启动"那张卡片）才拦。
                 facts.WeGameLoginPhase = IsWeGameProcess(proc) && !_clientRunning;
+                // 客户端刚起来这 20 秒里，WeGame 的窗口递上来算"启动流程"，不按自弹打回去
+                facts.WeGameLaunchGrace = IsWeGameProcess(proc) && _clientRunning &&
+                                          _clientStartedAt != Clock.Never &&
+                                          Clock.AgeMs(_clientStartedAt) <= FocusRules.WeGameLaunchGraceMs;
                 // 这个 hwnd 在本次判定之前是不是已经见过 —— 必须在 IsFirstClientWindow 之前取，
                 // 因为它会把当前 hwnd 写进 _knownWindows（副作用）。
                 bool knownBefore;
@@ -1509,7 +1517,8 @@ namespace LolFocusGuard
                         decision.Code == DecisionCode.AllowSwitching ||
                         decision.Code == DecisionCode.AllowSwitchCredential ||
                         decision.Code == DecisionCode.AllowFirstClientWindow ||
-                        decision.Code == DecisionCode.AllowWeGameLogin;
+                        decision.Code == DecisionCode.AllowWeGameLogin ||
+                        decision.Code == DecisionCode.AllowWeGameLaunch;
 
                     // 一次性凭据用完即废：只在"就是它授权了这次放行"时清掉，
                     // 别的证据（点窗口/点任务栏）放行时凭据留着给下一次也是对的。
@@ -1570,6 +1579,13 @@ namespace LolFocusGuard
                         _lastWegameAllowLogAt = Clock.NowMs();
                         Log(string.Format("放行 WeGame 窗口（登录阶段，客户端还没起来）：class={0}，标题=\"{1}\"",
                             ClassNameOf(hwnd), TitleOf(hwnd)));
+                    }
+                    break;
+                case DecisionCode.AllowWeGameLaunch:
+                    if (_verbose)
+                    {
+                        Log(string.Format("放行原因: WeGame 启动流程（客户端刚起来 {0:0}ms，{1}ms 内都算启动）",
+                            Clock.AgeMs(_clientStartedAt), FocusRules.WeGameLaunchGraceMs));
                     }
                     break;
                 case DecisionCode.AllowFirstClientWindow:

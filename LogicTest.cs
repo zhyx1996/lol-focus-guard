@@ -165,6 +165,22 @@ internal static class LogicTest
         f.ClickOnTarget = true;
         Case("WeGame 登录放行优先于点击判据 → 仍放行", f, true, DecisionCode.AllowWeGameLogin);
 
+        // 客户端刚起来那 20 秒：WeGame 递窗口是启动流程的一部分（真机 21:54:42 抓到过）
+        f = Idle();
+        f.WeGameLaunchGrace = true;
+        Case("客户端刚起来 20 秒内 WeGame 递窗口（启动流程）→ 放行", f, true, DecisionCode.AllowWeGameLaunch);
+
+        f = Idle();
+        f.WeGameLaunchGrace = true;
+        f.ClickAgeMs = 100;
+        f.ClickOnTarget = false;
+        Case("启动宽限优先于「按在别处」→ 仍放行", f, true, DecisionCode.AllowWeGameLaunch);
+
+        f = Idle();
+        f.WeGameLaunchGrace = false;
+        f.WeGameLoginPhase = false;
+        Case("启动宽限之外、客户端已在跑、没按键 → 照拦", f, false, DecisionCode.BlockNoClick);
+
         // ---- 放行：防拉锯 ----
         f = Idle();
         f.Suppressed = true;
