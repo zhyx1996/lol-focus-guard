@@ -105,6 +105,9 @@ foreach ($raw in $all) {
         if ($null -ne $tsNow -and $lastFgProc -ne '') {
             $lastAllowAt = $tsNow
             $lastAllowProc = $lastFgProc
+            # 配对用掉就清掉：一行放行只能对上它前面那一次前台变化，
+            # 否则后面另一个窗口的放行会错误地沿用旧进程名，把"复发"算错。
+            $lastFgProc = ''
         }
         continue
     }
