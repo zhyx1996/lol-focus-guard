@@ -158,6 +158,19 @@ namespace LolFocusGuard
         [DllImport("kernel32.dll")]
         public static extern uint GetTickCount();
 
+        // ---- 会话通知（锁屏/解锁）：wtsapi32.dll，挂在离屏 HotkeyWindow 上收窗口消息 ----
+        // 用来修"解锁后 Windows 把前台还给客户端 → 被当成它自己弹出来"这条误判。
+        public const int WM_WTSSESSION_CHANGE = 0x02B1;
+        public const int WTS_SESSION_LOCK = 0x7;
+        public const int WTS_SESSION_UNLOCK = 0x8;
+        public const int NOTIFY_FOR_THIS_SESSION = 0;
+
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        public static extern bool WTSRegisterSessionNotification(IntPtr hWnd, int dwFlags);
+
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        public static extern bool WTSUnRegisterSessionNotification(IntPtr hWnd);
+
         // ---- 低级输入钩子（WH_MOUSE_LL / WH_KEYBOARD_LL）：不注入，回调跑在我们自己线程里 ----
         public const int WH_KEYBOARD_LL = 13;
         public const int WH_MOUSE_LL = 14;
@@ -328,6 +341,12 @@ namespace LolFocusGuard
         // 不会被系统时钟往回拨搞成"无限期放弃"。
         private const int SUPPRESS_MS = 15000;
         private readonly Dictionary<IntPtr, long> _suppressedFrom = new Dictionary<IntPtr, long>();
+        // 上次解锁/恢复会话的时刻（单调时钟）。Windows 在解锁后会把前台还给锁屏前那个窗口，
+        // 那一跳没有任何点击/Alt 证据，会被判成"它自己弹出来" → 用户看到"我刚解锁它就被缩掉"。
+        private long _lastUnlockAt = Clock.Never;
+        private long _lastUnlockLogAt = Clock.Never;
+        // 解锁宽限：只认 2 秒。再长就等于每次解锁白送一段免疫期（解锁后客户端真自弹也会被放行）。
+        private const int UNLOCK_GRACE_MS = 2000;
         // Alt / Win 最后一次按下的时间：这两个键才是"切窗口"用的
         private long _lastModifierAt = Clock.Never;
         // 上面那一下按的是 Win 还是 Alt。
@@ -454,6 +473,31 @@ namespace LolFocusGuard
         public bool Paused { get { return _paused; } }
         public DateTime ResumeAt { get { return _resumeAt; } }
         public string LogPath { get { return _logPath; } }
+
+        /// <summary>
+        /// 会话状态变化（锁屏 / 解锁）。由 HotkeyWindow 的 WM_WTSSESSION_CHANGE 消息转发进来，
+        /// 跑在 UI 线程上，所以这里只记时间戳 + 清掉待办，不碰窗口、不做耗时操作。
+        ///
+        /// 为什么需要它：锁屏时客户端在前台，解锁后 Windows 会把前台还原给客户端。
+        /// 那一跳没有任何点击/Alt 证据（你是在锁屏界面按键解锁的，输入证据早就过期），
+        /// 判定会落到 BlockNoClick → 把它最小化，用户观感是"我刚解锁它就被缩掉了"。
+        /// 所以解锁后的 2 秒内前台变化一律不压回去（AllowJustUnlocked）。
+        /// </summary>
+        public void OnSessionChanged(bool unlocked)
+        {
+            if (unlocked)
+            {
+                _lastUnlockAt = Clock.NowMs();
+                // 解锁前那条"待重试"作废：否则 400ms 后它会拿着一条旧待办去压
+                // 一个刚从锁屏恢复的窗口，等于这条宽限白给。
+                _pendingBlockHwnd = IntPtr.Zero;
+                if (_verbose) Log("会话已解锁：接下来 " + UNLOCK_GRACE_MS + "ms 内的前台变化算\"系统恢复\"，不压回去");
+            }
+            else if (_verbose)
+            {
+                Log("会话已锁定（锁屏）");
+            }
+        }
 
 
         /// <summary>暂停一段时间（到点自动恢复）。</summary>
@@ -1336,6 +1380,9 @@ namespace LolFocusGuard
                 // 注意：这个方法有副作用（记住"这个窗口见过了"），必须调用
                 facts.FirstClientWindow = IsFirstClientWindow(hwnd, proc);
                 facts.Suppressed = IsSuppressed(hwnd);
+                // 刚解锁 / 恢复会话（2 秒内）：Windows 会把前台还给锁屏前那个窗口，
+                // 这不是它自己弹出来。_lastUnlockAt 用单调时钟，改系统时间也不会永久成立。
+                facts.JustUnlocked = Clock.Within(_lastUnlockAt, UNLOCK_GRACE_MS);
                 // 刚刚放行过 → 别再压回去（"我刚点开你就给我最小化"）。按两种情况分开给：
                 //   · 同一个 hwnd：3 秒（你刚才就在用它，这条是"点不出来"的防线，不能动）；
                 //   · 同进程的**另一个已知窗口**：600ms（再宽就成了"点过客户端任何一处，
@@ -1461,6 +1508,17 @@ namespace LolFocusGuard
                         // 会以为守卫没在跑（这条原来在非 verbose 下完全静默）。
                         _lastSuppressedLogAt = Clock.NowMs();
                         Log(string.Format("放弃拦截期内放行（不再压回去）：{0}（pid={1}，标题=\"{2}\"）",
+                            ProcNameOfCached(hwnd), ProcIdOf(hwnd), TitleOf(hwnd)));
+                    }
+                    break;
+                case DecisionCode.AllowJustUnlocked:
+                    if (_verbose) Log("放行原因: 刚解锁/恢复会话（不是它自己弹的）");
+                    else if (Clock.AgeMs(_lastUnlockLogAt) > 3000)
+                    {
+                        // 非 verbose 也留一行：用户"刚解锁就被缩掉"时看日志，
+                        // 得能看到"这次为什么没压回去"，否则会以为守卫瞎放行。
+                        _lastUnlockLogAt = Clock.NowMs();
+                        Log(string.Format("放行（不是拦截）：刚解锁/恢复会话，Windows 把前台还给了它：{0}（pid={1}，标题=\"{2}\"）",
                             ProcNameOfCached(hwnd), ProcIdOf(hwnd), TitleOf(hwnd)));
                     }
                     break;
@@ -2326,10 +2384,16 @@ namespace LolFocusGuard
         }
     }
 
-    /// <summary>用来接收全局热键的隐藏窗口。</summary>
+    /// <summary>用来接收全局热键 + 会话通知（锁屏/解锁）的隐藏窗口。</summary>
     internal sealed class HotkeyWindow : Form
     {
         public event Action HotkeyPressed;
+
+        /// <summary>会话状态变化：参数 true = 解锁/恢复会话，false = 锁屏。</summary>
+        public event Action<bool> SessionChanged;
+
+        // 已经注册会话通知的那个 hwnd（注销时用它，避免在销毁途中读 Handle 属性把窗口重建出来）
+        private IntPtr _sessionNotifyHwnd = IntPtr.Zero;
 
         // 关键：不要因为 Show() 而抢走前台焦点
         protected override bool ShowWithoutActivation
@@ -2356,12 +2420,63 @@ namespace LolFocusGuard
             }
         }
 
+        /// <summary>
+        /// 注册会话通知（锁屏/解锁）。宿主就是这个窗口 —— 它已经有一个在收消息的隐藏 hwnd，
+        /// 不用再新开一个窗口。返回 false = 这台机器上挂不上（个别精简系统 / 服务会话），
+        /// 调用方写一行日志即可，功能照旧（只是没有"解锁后别压回去"这条兜底）。
+        /// </summary>
+        public bool RegisterSessionNotify()
+        {
+            try
+            {
+                IntPtr h = Handle; // 确保句柄已创建（TrayApp 里 Show() 之后调）
+                if (!Native.WTSRegisterSessionNotification(h, Native.NOTIFY_FOR_THIS_SESSION)) return false;
+                _sessionNotifyHwnd = h; // 记下来：注销时不再碰 Handle 属性（那会在销毁途中重建窗口）
+                return true;
+            }
+            catch
+            {
+                return false; // wtsapi32.dll 缺失之类：绝不能因为兜底功能把程序搞崩
+            }
+        }
+
+        private void UnregisterSessionNotify()
+        {
+            if (_sessionNotifyHwnd == IntPtr.Zero) return;
+            try
+            {
+                Native.WTSUnRegisterSessionNotification(_sessionNotifyHwnd);
+            }
+            catch
+            {
+            }
+            _sessionNotifyHwnd = IntPtr.Zero; // 幂等：重复调用不会重复注销
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            // 窗口销毁前必须注销，否则系统会把消息发给一个已经没了的 hwnd。
+            // 只用缓存的句柄，不读 Handle 属性 —— 在 OnHandleDestroyed 里读它可能把窗口重建出来。
+            UnregisterSessionNotify();
+            base.OnHandleDestroyed(e);
+        }
+
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == Native.WM_HOTKEY && HotkeyPressed != null)
             {
                 HotkeyPressed();
                 return;
+            }
+            // 锁屏 / 解锁：只认这两个，别的会话事件（远程连接、控制台切换…）不关心
+            if (m.Msg == Native.WM_WTSSESSION_CHANGE)
+            {
+                int code = m.WParam.ToInt32();
+                if (code == Native.WTS_SESSION_UNLOCK || code == Native.WTS_SESSION_LOCK)
+                {
+                    if (SessionChanged != null) SessionChanged(code == Native.WTS_SESSION_UNLOCK);
+                    return;
+                }
             }
             base.WndProc(ref m);
         }
@@ -2435,6 +2550,14 @@ namespace LolFocusGuard
             if (!Native.RegisterHotKey(handle, 1, Native.MOD_CONTROL | Native.MOD_ALT, 0x78))
             {
                 _guard.Log("Ctrl+Alt+F9 热键注册失败（可能被占用），请用托盘菜单");
+            }
+
+            // 锁屏/解锁通知：挂在同一个离屏窗口上（和热键共用一个 hwnd）。
+            // 挂不上不算错误，只少一条"解锁后别把窗口压回去"的兜底。
+            _hotkeyWindow.SessionChanged += delegate(bool unlocked) { _guard.OnSessionChanged(unlocked); };
+            if (!_hotkeyWindow.RegisterSessionNotify())
+            {
+                _guard.Log("会话通知注册失败（解锁时可能会把窗口误判成自弹）");
             }
 
             _uiTimer = new System.Windows.Forms.Timer();

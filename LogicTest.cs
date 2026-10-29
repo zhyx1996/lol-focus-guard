@@ -154,6 +154,22 @@ internal static class LogicTest
         f.Suppressed = true;
         Case("正在防拉锯放弃期 → 放行（不再跟它拉锯）", f, true, DecisionCode.AllowSuppressed);
 
+        // ---- 放行：刚解锁 / 恢复会话（2 秒）----
+        // 锁屏时客户端在前台，解锁后 Windows 把前台还给它；这时没有任何点击/Alt 证据，
+        // 不加这条就会被判成"它自己弹出来" → 用户看到"我刚解锁它就被缩掉"。
+        f = Idle();
+        f.JustUnlocked = true;
+        Case("刚解锁（2 秒内）窗口被系统还原到前台 → 放行", f, true, DecisionCode.AllowJustUnlocked);
+
+        f = Idle();
+        f.JustUnlocked = false;   // 解锁已经 3 秒，宽限过了：恢复正常判定
+        Case("解锁已经 3 秒、也没有按键 → 照拦（宽限不能白送免疫期）", f, false, DecisionCode.BlockNoClick);
+
+        f = Idle();
+        f.JustUnlocked = true;
+        f.TestModeOnly = true;
+        Case("测试模式优先于「刚解锁」→ 还是拦", f, false, DecisionCode.BlockTestMode);
+
         // ---- 放行：刚放行过的窗口（同一个 hwnd，3 秒） ----
         // 真机上踩到的：你点了客户端（放行），客户端内部又自己抢了一次焦点，
         // 3 秒内再压回去的观感就是"我刚点开你就给我最小化"。

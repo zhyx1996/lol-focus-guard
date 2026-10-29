@@ -20,6 +20,12 @@ namespace LolFocusGuard
         public bool Suppressed;
 
         /// <summary>
+        /// 刚刚解锁 / 恢复了会话（2 秒内）。锁屏时客户端在前台，解锁后 Windows 会把前台
+        /// 还给它 —— 那一跳是系统行为，不是你让它弹的；拿它判自弹就会"我刚解锁它就被缩掉"。
+        /// </summary>
+        public bool JustUnlocked;
+
+        /// <summary>
         /// 刚刚放行过**这个窗口**（3 秒内）：你点了它，它内部又抢了一次焦点。
         /// 这条是「我刚点开你就给我最小化」的防线，不能动。
         /// </summary>
@@ -62,6 +68,7 @@ namespace LolFocusGuard
         AllowWeGameLogin,
         AllowFirstClientWindow,
         AllowSuppressed,
+        AllowJustUnlocked,
         AllowJustAllowed,
         AllowJustAllowedProc,
         AllowModifier,
@@ -108,6 +115,12 @@ namespace LolFocusGuard
 
             // 3) 正在防拉锯的放弃期里
             if (f.Suppressed) return new Decision(true, DecisionCode.AllowSuppressed);
+
+            // 3.4) 刚解锁 / 恢复会话（2 秒内）：锁屏时客户端就在前台，解锁后 Windows 会把
+            //      前台还给它。这一跳是**系统恢复**，不是你让它弹的 —— 拿它判自弹就会
+            //      "我刚解锁它就被缩掉"。放行理由足够硬（会话事件），所以排在"刚放行过"之前；
+            //      但排在 WeGame 登录阶段 / 首次窗口之后（那两条是更强的"这次一定是正常的"）。
+            if (f.JustUnlocked) return new Decision(true, DecisionCode.AllowJustUnlocked);
 
             // 3.5) 刚刚才放行过**这个窗口**：你点它 → 它内部又自己抢了一次焦点。
             //      这里压回去的观感就是"我刚点开你就给我最小化"，所以干脆不压。
