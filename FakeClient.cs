@@ -30,15 +30,18 @@ internal static class Program
         private readonly bool _quiet;
         private bool _minimizedOnce;
         private readonly bool _modal;
+        private readonly bool _stayMinimized;
 
         /// <summary>
         /// quiet = 不自动弹（窗口就静静待着）。给"需要确定前台顺序"的测试用：
         /// 自动弹的 FakeClient 每秒抢一次前台，Alt+Tab 的 MRU 顺序根本没法控制。
         /// </summary>
-        public FakeClient(bool quiet, int intervalMs, bool modal)
+        public FakeClient(bool quiet, int intervalMs, bool modal, bool stayMinimized)
         {
             _quiet = quiet;
             _modal = modal;
+            _stayMinimized = stayMinimized;
+            if (_stayMinimized) WindowState = FormWindowState.Minimized;
             Text = "FakeClient";
             ClientSize = new Size(420, 260);
             StartPosition = FormStartPosition.Manual;
@@ -67,6 +70,15 @@ internal static class Program
         {
             try
             {
+                // minimized 模式：保持最小化，却把 SetForegroundWindow 打在自己的（图标状态）窗口上 ——
+                // 真机 22:17:18 的 `尺寸=237x39@(-32000,-32000) 最小化=True` 就是这个动作。
+                // 守卫应该回一句"放行原因: 它自己就是最小化状态"，而不是把它打回。
+                if (_stayMinimized)
+                {
+                    SetForegroundWindow(Handle);
+                    Log("raise-while-minimized ok=" + (GetForegroundWindow() == Handle));
+                    return;
+                }
                 bool iconic = IsIconic(Handle);
                 if (iconic)
                 {
@@ -115,9 +127,11 @@ internal static class Program
         // fast 模式：80ms 抢一次前台，用来模拟"对局就绪"那种被打回后立刻又顶回来的客户端
         bool fast = !quiet && args.Length > 0 && string.Equals(args[0], "fast", StringComparison.OrdinalIgnoreCase);
         bool modal = !quiet && args.Length > 0 && string.Equals(args[0], "modal", StringComparison.OrdinalIgnoreCase);
+        bool stayMin = !quiet && args.Length > 0 && string.Equals(args[0], "minimized", StringComparison.OrdinalIgnoreCase);
         int interval = fast ? 80 : 1200;
         if (quiet) Log("quiet 模式：不自动弹");
         if (fast) Log("fast 模式：每 80ms 抢一次前台");
-        Application.Run(new FakeClient(quiet, interval, modal));
+        if (stayMin) Log("minimized 模式：保持最小化，但持续硬抢前台");
+        Application.Run(new FakeClient(quiet, interval, modal, stayMin));
     }
 }

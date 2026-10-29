@@ -1604,7 +1604,10 @@ namespace LolFocusGuard
                 case DecisionCode.AllowSelfMinimized:
                     if (_verbose)
                     {
-                        Log(string.Format("放行原因: 它自己就是最小化状态（{0}），压回去只会打断它的还原", where));
+                        // where 是"你按键时指针压在谁身上"，没有按键时是空的 —— 空就别写个空括号
+                        Log(where.Length > 0
+                            ? string.Format("放行原因: 它自己就是最小化状态（指针在 {0}），压回去只会打断它的还原", where)
+                            : "放行原因: 它自己就是最小化状态，压回去只会打断它的还原");
                     }
                     break;
                 case DecisionCode.AllowWeGameLaunch:
