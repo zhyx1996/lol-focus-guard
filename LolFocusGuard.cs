@@ -2473,7 +2473,7 @@ namespace LolFocusGuard
                         blockedWindows[key] = n + 1;
                     }
                 }
-                else if (line.IndexOf("放弃拦截 60 秒", StringComparison.Ordinal) >= 0)
+                else if (line.IndexOf("放弃拦截 15 秒", StringComparison.Ordinal) >= 0)
                 {
                     giveUpCount++;
                 }
@@ -2489,7 +2489,10 @@ namespace LolFocusGuard
                 else if (line.IndexOf("不放行: ", StringComparison.Ordinal) >= 0)
                 {
                     string why = line.Substring(line.IndexOf("不放行: ", StringComparison.Ordinal) + "不放行: ".Length).Trim();
-                    if (why.IndexOf("没有输入", StringComparison.Ordinal) >= 0) noInputCount++;
+                    // 日志措辞改过两次，这里按现在的两种写法匹配（旧的"没有输入"留着兼容老日志）
+                    if (why.IndexOf("没有尚未用掉的鼠标按键", StringComparison.Ordinal) >= 0 ||
+                        why.IndexOf("内没有鼠标按键按下", StringComparison.Ordinal) >= 0 ||
+                        why.IndexOf("没有输入", StringComparison.Ordinal) >= 0) noInputCount++;
                     else inputElsewhereCount++;
                 }
             }
@@ -2508,9 +2511,15 @@ namespace LolFocusGuard
                 sb.AppendLine(string.Format("  {0} ×{1}", kv.Key, kv.Value));
             }
             sb.AppendLine();
-            sb.AppendLine(string.Format("放弃拦截（防拉锯，10 秒内拦 6 次就停手）: {0} 次", giveUpCount));
+            sb.AppendLine(string.Format("放弃拦截（防拉锯：10 秒内 5 次压不动就停手 15 秒）: {0} 次", giveUpCount));
             sb.AppendLine(string.Format("判为自弹的依据:「一直没有输入」{0} 次，「输入落在别的程序上」{1} 次",
                 noInputCount, inputElsewhereCount));
+            if (blockCount > 0 && noInputCount + inputElsewhereCount == 0)
+            {
+                // 「不放行: …」这类依据只在 --verbose 下才写日志，普通日志里数不出来；
+                // 不说明的话这一栏永远显示 0 次，看着像统计坏了。
+                sb.AppendLine("  （这一栏要看 --verbose 日志；普通日志只记『拦截 #N』）");
+            }
 
             WriteReport(sb.ToString(), logPath);
         }
