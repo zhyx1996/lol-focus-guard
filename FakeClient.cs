@@ -25,10 +25,16 @@ internal static class Program
     private sealed class FakeClient : Form
     {
         private readonly Timer _timer;
+        private readonly bool _quiet;
         private bool _minimizedOnce;
 
-        public FakeClient()
+        /// <summary>
+        /// quiet = 不自动弹（窗口就静静待着）。给"需要确定前台顺序"的测试用：
+        /// 自动弹的 FakeClient 每秒抢一次前台，Alt+Tab 的 MRU 顺序根本没法控制。
+        /// </summary>
+        public FakeClient(bool quiet)
         {
+            _quiet = quiet;
             Text = "FakeClient";
             ClientSize = new Size(420, 260);
             StartPosition = FormStartPosition.Manual;
@@ -37,12 +43,13 @@ internal static class Program
             _timer = new Timer();
             _timer.Interval = 1200;
             _timer.Tick += OnTick;
+            if (_quiet) _timer.Enabled = false;
         }
 
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            _timer.Start();
+            if (!_quiet) _timer.Start();
         }
 
         private void OnTick(object sender, EventArgs e)
@@ -93,6 +100,8 @@ internal static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Log("启动");
-        Application.Run(new FakeClient());
+        bool quiet = args.Length > 0 && string.Equals(args[0], "quiet", StringComparison.OrdinalIgnoreCase);
+        if (quiet) Log("quiet 模式：不自动弹");
+        Application.Run(new FakeClient(quiet));
     }
 }

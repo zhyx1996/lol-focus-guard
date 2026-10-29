@@ -239,6 +239,13 @@ pwsh ./verify-real.ps1 -VerboseLog   # 如果那局是 --verbose 跑的，判定
   目前靠"客户端进程起没起来"区分（登录阶段全放行）。极端时序下（卡片先弹、客户端后起）
   卡片可能被放行一次。
 - EXCLUSIVE 全屏游戏下的观感需要在真打一局时确认。
+- **Win11 的 `EVENT_SYSTEM_SWITCHSTART/SWITCHEND` 可能一次都不发**（本机就是：心跳里
+  「切换器事件=0次」，可日志里明明有"任务切换"窗口）。这时 Alt+Tab 只能靠**窗口身份**认：
+  `ForegroundStaging` / `MultitaskingViewFrame` / `TaskSwitcherWnd` /
+  `XamlExplorerHostIslandWindow`（标题"任务切换"）。看见切换器就给你**下一次窗口激活一张
+  一次性凭据**（`SwitchCredentialMs=2500`，用掉即失效）——不会像固定宽限那样留一段无防时间。
+  日志里对应 `识别到任务切换器（…）` 和 `放行原因: 你刚用 Alt+Tab/任务视图切窗口（…凭据用掉了）`。
+  手工验证：Alt+Tab 切到客户端，然后看日志有没有这两行。
 - **英雄联盟的窗口会挡掉别的进程的 `ShowWindow`**：实测它的登录窗口
   （`Client.exe` / `TWINCONTROL`）`ShowWindow(SW_MINIMIZE)` 直接返回 `False`、窗口纹丝不动，
   `SetWindowPos` 也一样；但它认 `WM_SYSCOMMAND / SC_MINIMIZE`——`PostMessage` 过去立刻最小化。
