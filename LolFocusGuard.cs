@@ -230,6 +230,9 @@ namespace LolFocusGuard
         private const int POLL_MS = 50;
         private const int SW_MINIMIZE = Native.SW_MINIMIZE;
 
+        // 最小化补压次数：客户端在自己恢复的过程里会把我们的最小化顶回去，压一次常常不够。
+        private const int MINIMIZE_RETRIES = 2;
+
         private readonly HashSet<string> _targets;
         private readonly string _logPath;
         private readonly bool _verbose;
@@ -1909,11 +1912,30 @@ namespace LolFocusGuard
                         {
                             Native.PostMessage(hwnd, Native.WM_SYSCOMMAND, (IntPtr)Native.SC_MINIMIZE, IntPtr.Zero);
                             System.Threading.Thread.Sleep(15);
-                            if (_verbose)
+                        }
+
+                        // 补压：真机日志里见过"第一次目标最小化=False、一秒后它再弹、再压才成功"。
+                        // 客户端在恢复自己的时候会把我们的最小化顶回去，一次没压住很常见 ——
+                        // 那就别把"没压住"留给你去多点几下，在动作线程里补压两次（总共多花 ~30ms）。
+                        int retries = 0;
+                        while (!Native.IsIconic(hwnd) && retries < MINIMIZE_RETRIES)
+                        {
+                            retries++;
+                            Native.ShowWindow(hwnd, SW_MINIMIZE);
+                            Native.PostMessage(hwnd, Native.WM_SYSCOMMAND, (IntPtr)Native.SC_MINIMIZE, IntPtr.Zero);
+                            System.Threading.Thread.Sleep(15);
+                        }
+                        if (_verbose)
+                        {
+                            if (Native.IsIconic(hwnd))
                             {
-                                Log(Native.IsIconic(hwnd)
-                                    ? "ShowWindow 被挡，改用 WM_SYSCOMMAND/SC_MINIMIZE 最小化成功"
-                                    : "最小化失败（ShowWindow 和 WM_SYSCOMMAND 都没生效），只交还前台");
+                                Log(retries > 0
+                                    ? "ShowWindow 被挡，改用 WM_SYSCOMMAND/SC_MINIMIZE 最小化成功（补压 " + retries + " 次）"
+                                    : "最小化成功");
+                            }
+                            else
+                            {
+                                Log("最小化失败（ShowWindow 和 WM_SYSCOMMAND 都没生效，补压 " + retries + " 次也没用），只交还前台");
                             }
                         }
                     }
