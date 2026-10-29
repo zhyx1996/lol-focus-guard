@@ -53,7 +53,8 @@ Get-Process LolFocusGuard -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 400
 Remove-Item $guardLog -ErrorAction SilentlyContinue
 
-$guard = Start-Process (Join-Path $root 'LolFocusGuard.exe') -ArgumentList '--targets=FakeClient', '--verbose' -PassThru
+$tgts = if ($WithWindow) { 'PopTarget' } else { 'FakeClient' }
+$guard = Start-Process (Join-Path $root 'LolFocusGuard.exe') -ArgumentList "--targets=$tgts", '--verbose' -PassThru
 Start-Sleep -Milliseconds 800
 if ($guard.HasExited) {
     '跳过：守卫启动即退出（单实例互斥锁可能还被上一轮占着）'
@@ -111,13 +112,26 @@ if ($afterLock -match '会话已锁定') {
     $pass = $false
 }
 
-# 顺带确认这行放行原因不会污染统计：它不含「拦截 #」也不含「放行原因: 」
-$polluted = ($afterUnlock + $afterLock) -match '放行原因: 刚解锁'
-if ($polluted) { '注意：--verbose 下出现了放行原因行（正常，仅供排除统计污染）' }
+# 非 verbose 的那行「放行（不是拦截）：刚解锁…」必须不带「放行原因: 」「拦截 # 」，否则会污染 --report 统计
+$noisyLine = ($afterUnlock + $afterLock) -split "`r?`n" | Where-Object { $_ -match '放行（不是拦截）' } | Select-Object -First 1
+if ($noisyLine -and ($noisyLine -match '放行原因: ' -or $noisyLine -match '拦截 #')) {
+    'FAIL: 非 verbose 的解锁放行行污染了统计口径'
+    $noisyLine
+    $pass = $false
+}
 
 # ---------- 第二段（可选）：解锁之后真的有一个被监控窗口抢前台 → 必须放行 ─---------
 if ($WithWindow -and $pass) {
     $flag = Join-Path $env:TEMP 'poptarget.flag'
+    $pt = $null
+    try {
+    # 干净克隆上没有 PopTarget.exe（build.ps1 不产、*.exe 被 gitignore）→ 现场编译
+    if (-not (Test-Path (Join-Path $root 'PopTarget.exe'))) {
+        $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+        if (-not (Test-Path $csc)) { $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe' }
+        & $csc /nologo /target:winexe /optimize+ /out:BgWin.exe /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll (Join-Path $root 'PopTarget.cs') | Out-Null
+        Copy-Item (Join-Path $root 'BgWin.exe') (Join-Path $root 'PopTarget.exe') -Force
+    }
     $pt = Start-Process (Join-Path $root 'PopTarget.exe') -ArgumentList 'target' -PassThru
     Start-Sleep -Seconds 2
     $beforeLen = (Get-Content $guardLog -Raw -ErrorAction SilentlyContinue).Length
@@ -134,8 +148,10 @@ if ($WithWindow -and $pass) {
         ($part -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 5)
         $pass = $false
     }
-    Stop-Process -Id $pt.Id -Force -ErrorAction SilentlyContinue
-    Remove-Item $flag -ErrorAction SilentlyContinue
+    } finally {
+        if ($pt) { Stop-Process -Id $pt.Id -Force -ErrorAction SilentlyContinue }
+        Remove-Item $flag -ErrorAction SilentlyContinue
+    }
 }
 
 Stop-Process -Id $guard.Id -Force -ErrorAction SilentlyContinue

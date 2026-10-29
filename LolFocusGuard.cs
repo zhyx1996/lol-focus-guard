@@ -1969,6 +1969,10 @@ namespace LolFocusGuard
         /// </summary>
         private bool UserSwitchedSince(long sinceMs)
         {
+            // --no-click-allow 是"测试用，等于什么都拦"（README 语义）：这条"你接管了"的
+            // 通道也必须一起关掉，否则测试跑到一半你点一下任务栏，排队中/刚执行的那次拦截
+            // 仍会被取消 → test-fake-client 偶发假 FAIL，而且失败归因也会被算成"你叫回来的"。
+            if (_noClickAllow) return false;
             double sinceAge = Clock.AgeMs(sinceMs);
             double clickAge = Clock.AgeMs(_lastClickAt);
             bool clickNewer = clickAge < sinceAge;
