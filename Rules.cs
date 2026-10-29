@@ -50,6 +50,17 @@ namespace LolFocusGuard
         /// <summary>Alt+Tab 切换器关掉（SWITCHEND）距今多少毫秒。没关过就是 MaxValue。</summary>
         public double SwitchEndedMs = double.MaxValue;
 
+        /// <summary>
+        /// 任务切换器（Alt+Tab 浮层 / ForegroundStaging）刚出现多久 —— **一次性凭据**，
+        /// 只用一次就作废（Guard 那边放行后立刻清掉）。
+        ///
+        /// 为什么还要这条：这台 Win11 上 EVENT_SYSTEM_SWITCHSTART/END 一次都不发，
+        /// 只能按窗口身份认切换器。但"看见切换器就开 2.5 秒无防窗口"代价太大
+        /// （你 Alt+Tab 到任何程序，那 2.5 秒里客户端自弹都会被放行）。
+        /// 所以改成：切换器出现 = 给你**下一次**窗口激活一张一次性凭据，用完即失效。
+        /// </summary>
+        public double SwitcherPendingMs = double.MaxValue;
+
         /// <summary>最近一次「鼠标物理按键按下」距今多少毫秒。没按过就是 MaxValue。</summary>
         public double ClickAgeMs = double.MaxValue;
 
@@ -73,6 +84,7 @@ namespace LolFocusGuard
         AllowJustAllowedProc,
         AllowModifier,
         AllowSwitching,
+        AllowSwitchCredential,
         AllowPrevWindowGone,
         AllowClickedTarget,
         AllowClickedShell,
@@ -98,6 +110,9 @@ namespace LolFocusGuard
         public const int ModifierGraceMs = 1500;
         public const int ClickGraceMs = 350;   // 按键按下后多久内算"这次切换是你点的"
         public const int SwitchEndGraceMs = 2500; // Alt+Tab 切换器关掉后多久内还算"你切的"
+
+        /// <summary>一次性切换凭据的有效期（切换器出现后这么久内落到前台的那个窗口算你切的）。</summary>
+        public const int SwitchCredentialMs = 2500;
 
         /// <summary>
         /// 判定顺序就是优先级，改顺序 = 改行为，测试里有对应用例。
@@ -140,6 +155,12 @@ namespace LolFocusGuard
             //      切换器开着/刚关掉是比"按过 Alt"更硬的证据，所以单独给一条，不改 ModifierGraceMs。
             if (f.Switching || f.SwitchEndedMs <= SwitchEndGraceMs)
                 return new Decision(true, DecisionCode.AllowSwitching);
+
+            // 4.6) 一次性切换凭据：切换器出现过（这台机器上 SWITCH 事件不发，只能按窗口身份认），
+            //      那么**下一次**前台激活就是你切过去的；用过一次就作废（Guard 里清掉），
+            //      不会像"2.5 秒宽限"那样留一整段无防窗口。
+            if (f.SwitcherPendingMs <= SwitchCredentialMs)
+                return new Decision(true, DecisionCode.AllowSwitchCredential);
 
             // 5) 上一个前台窗口已经没了：前台自然接管，不算它抢
             if (f.PrevWindowGone) return new Decision(true, DecisionCode.AllowPrevWindowGone);

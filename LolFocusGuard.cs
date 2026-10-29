@@ -368,6 +368,11 @@ namespace LolFocusGuard
         private volatile bool _altTabOpen;
         private long _lastSwitchStartAt = Clock.Never;
         private long _lastSwitchEndAt = Clock.Never;
+
+        // 一次性切换凭据：看见任务切换器时打上，下一次前台激活用它放行后立刻清掉。
+        // 为什么不用 _lastSwitchEndAt 的 2.5 秒宽限了：那等于"你 Alt+Tab 到任何程序，
+        // 接下来 2.5 秒客户端自弹全放行"，对"不许它自弹"这个目标太松。
+        private long _switchCredentialAt = Clock.Never;
         private int _switchCount;
         // 切换器"开着"最多认多久：SWITCHEND 丢掉时不能让守卫永久放行（见 PollOnce 里的自愈）
         private const int SWITCH_MAX_OPEN_MS = 10000;
@@ -1364,13 +1369,11 @@ namespace LolFocusGuard
                 // 不这么做的话：你按 Alt+Tab 切到客户端 → 我们当成它自己弹的 → 打回去 → 切不出来。
                 if (ProcClass.IsSwitcherWindow(proc, title, cls))
                 {
-                    long nowSwitch = Clock.NowMs();
-                    _lastSwitchStartAt = nowSwitch;
-                    _lastSwitchEndAt = nowSwitch;
+                    _switchCredentialAt = Clock.NowMs();
                     if (_verbose)
                     {
-                        Log(string.Format("识别到任务切换器（class={0}，标题=\"{1}\"）：接下来 {2}ms 内切到的窗口算你切过去的",
-                            cls, title, FocusRules.SwitchEndGraceMs));
+                        Log(string.Format("识别到任务切换器（class={0}，标题=\"{1}\"）：给你下一次窗口激活一张一次性凭据（{2}ms 内有效）",
+                            cls, title, FocusRules.SwitchCredentialMs));
                     }
                     return;
                 }
@@ -1389,7 +1392,13 @@ namespace LolFocusGuard
                     // 这一次前台变化如果是那一下点击引起的（比如点任务栏切到浏览器），
                     // 这份点击证据同样算"用掉了"。否则 2.5 秒内客户端自弹会搭这趟顺风车：
                     // 你点了任务栏去切浏览器，2 秒后客户端自己弹前台，还被判成"你点的"。
-                    if (!transitional) ConsumeClickEvidenceIfUsed();
+                    if (!transitional)
+                    {
+                        // 一次性切换凭据也在这作废：Alt+Tab 切到的是**别的程序**时，
+                        // 这次切换就到此为止了，别把凭据留到 2.5 秒后给客户端自弹用。
+                        _switchCredentialAt = Clock.Never;
+                        ConsumeClickEvidenceIfUsed();
+                    }
                     return;
                 }
 
@@ -1428,6 +1437,8 @@ namespace LolFocusGuard
                 // 慢客户端"Alt+Tab 过去 2 秒后才画出来"就靠这条救，1.5 秒的 Alt 宽限不够。
                 facts.Switching = _altTabOpen;
                 facts.SwitchEndedMs = Clock.AgeMs(_lastSwitchEndAt);
+                // 一次性切换凭据（见 _switchCredentialAt 的注释）
+                facts.SwitcherPendingMs = Clock.AgeMs(_switchCredentialAt);
                 // 「你手动切窗口」的硬证据：鼠标物理按键真的按下了（ClickWatchLoop 每 15ms 采一次），
                 // 以及按下那一刻指针落在谁身上。它自己抢前台的时候一个按键都没有，这条能把两者分开。
                 // 记下本次判定用的那一份点击证据（下面"用完即弃"要确认消费的还是同一份，
@@ -1467,8 +1478,13 @@ namespace LolFocusGuard
                         decision.Code == DecisionCode.AllowClickedShell ||
                         decision.Code == DecisionCode.AllowModifier ||
                         decision.Code == DecisionCode.AllowSwitching ||
+                        decision.Code == DecisionCode.AllowSwitchCredential ||
                         decision.Code == DecisionCode.AllowFirstClientWindow ||
                         decision.Code == DecisionCode.AllowWeGameLogin;
+
+                    // 一次性凭据用完即废：只在"就是它授权了这次放行"时清掉，
+                    // 别的证据（点窗口/点任务栏）放行时凭据留着给下一次也是对的。
+                    if (decision.Code == DecisionCode.AllowSwitchCredential) _switchCredentialAt = Clock.Never;
 
                     if (userEvidence)
                     {
@@ -1568,6 +1584,13 @@ namespace LolFocusGuard
                             ? "放行原因: Alt+Tab 切换器还开着（还没松手，是你在切）"
                             : string.Format("放行原因: 刚用 Alt+Tab 切完窗口（切换器关掉 {0:0}ms，{1}ms 内都算你切的）",
                                 Clock.AgeMs(_lastSwitchEndAt), FocusRules.SwitchEndGraceMs));
+                    }
+                    break;
+                case DecisionCode.AllowSwitchCredential:
+                    if (_verbose)
+                    {
+                        Log(string.Format("放行原因: 你刚用 Alt+Tab/任务视图切窗口（切换器出现 {0:0}ms 前，一次性凭据用掉了）",
+                            Clock.AgeMs(_switchCredentialAt)));
                     }
                     break;
                 case DecisionCode.AllowPrevWindowGone:

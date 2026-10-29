@@ -127,6 +127,16 @@ internal static class LogicTest
         Case("Alt+Tab 切换器关掉正好 2500ms → 放行（边界）", f, true, DecisionCode.AllowSwitching);
 
         f = Idle();
+        // 一次性切换凭据（这台机器 SWITCH 事件不发，靠窗口身份认切换器后打凭据）
+        f.SwitchEndedMs = double.MaxValue;
+        f.Switching = false;
+        f.SwitcherPendingMs = 800;
+        Case("切换器出现过 800ms（一次性凭据）→ 放行", f, true, DecisionCode.AllowSwitchCredential);
+        f.SwitcherPendingMs = 2400;
+        Case("凭据有效期边界 2400ms → 放行", f, true, DecisionCode.AllowSwitchCredential);
+        f.SwitcherPendingMs = 3000;
+        Case("凭据过期 3000ms、没按键 → 照拦", f, false, DecisionCode.BlockNoClick);
+        f.SwitcherPendingMs = double.MaxValue;
         f.SwitchEndedMs = 3000;   // 你写的用例：SWITCHEND 3 秒后不再放行
         Case("Alt+Tab 切换器关掉 3000ms 后 → 不再算你切的，没按键就拦", f, false, DecisionCode.BlockNoClick);
 
