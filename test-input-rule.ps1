@@ -115,11 +115,12 @@ if ($injectOk) {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match '前台变化 → PopTarget' -and $lines[$i] -match '按键=[0-9]+ms前@PopTarget') { $idx = $i; break }
     }
-    if ($idx -lt 0) { 'A 结果: 未知（点击没产生前台切换，看上面日志）' }
-    elseif ($idx + 1 -lt $lines.Count -and $lines[$idx + 1] -match '拦截 #') { 'A 结果: FAIL（用户点击被拦了）' }
+    $pass = $true
+    if ($idx -lt 0) { 'A 结果: FAIL（点击没产生前台切换，无法判定 —— 不能算通过）'; $pass = $false }
+    elseif ($idx + 1 -lt $lines.Count -and $lines[$idx + 1] -match '拦截 #') { 'A 结果: FAIL（用户点击被拦了）'; $pass = $false }
     else { 'A 结果: PASS（点击被识别为用户操作，未拦）' }
 
-} else { 'A 结果: 跳过（输入注入被安全软件拦了）' }
+} else { 'A 结果: 跳过（输入注入被安全软件拦了）'; $pass = $false }
 
 # ---------- B) PopTarget 自己抢前台（先最小化再恢复，保证有事件） ----------
 $before = (Get-Content $guardLog -Raw).Length
@@ -131,6 +132,7 @@ $partB = $now.Substring([Math]::Min($before, $now.Length))
 "=== B) PopTarget 自己抢前台之后的日志 ==="
 ($partB -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6)
 $blocked = ([regex]::Matches($partB, '拦截 #')).Count
-if ($blocked -ge 1) { 'B 结果: PASS（无输入的强制抢前台被拦）' } else { 'B 结果: FAIL（没拦）' }
+if ($blocked -ge 1) { 'B 结果: PASS（无输入的强制抢前台被拦）' } else { 'B 结果: FAIL（没拦）'; $pass = $false }
 
 Stop-Process -Id $guard.Id, $bg.Id, $pt.Id -Force -ErrorAction SilentlyContinue
+if ($pass) { '结果: PASS' } else { '结果: FAIL'; exit 1 }

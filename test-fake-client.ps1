@@ -59,13 +59,15 @@ $iconicNow = if ($hwnd -ne [IntPtr]::Zero) { [G]::IsIconic($hwnd) } else { $fals
 "假客户端弹了 $popCount 次，守卫拦了 $blockCount 次（其中识别为'从最小化弹出' $minimizedCount 次），当前前台=$fgNow 假窗口最小化=$iconicNow"
 
 $pass = $true
-$suppressed = ([regex]::Matches($guardText, '放弃拦截 60 秒')).Count
-# 防拉锯阀：同一窗口 10 秒内被拦超过 5 次就放弃 60 秒，所以期望拦的是前 6 次
-$expectedBlocks = [Math]::Min($popCount, 5)
-if ($blockCount -lt $expectedBlocks) { "FAIL: 只拦了 $blockCount 次（期望至少 $expectedBlocks 次）"; $pass = $false }
-else { "ok  : 拦了 $blockCount 次（假客户端一共弹了 $popCount 次）" }
-if ($popCount -gt 6 -and $suppressed -lt 1) { 'FAIL: 弹了这么多次却没触发防拉锯阀（会跟它一直拉锯）'; $pass = $false }
-elseif ($suppressed -ge 1) { "ok  : 触发防拉锯阀 $suppressed 次（拦 6 次后主动放弃 60 秒）" }
+# 防拉锯阀的判据现在是「我们压不动它」，不是「我们拦了几次」：
+# 每一次都成功把它压回去的话，失败计数一直是 0，本来就不该放弃拦截。
+# 所以这里期望的是"每次弹出都被拦"，只有真的压不住（日志里有"放弃拦截 15 秒"）才降级。
+$suppressed = ([regex]::Matches($guardText, '放弃拦截 15 秒')).Count
+$expectedBlocks = $popCount
+if ($blockCount -lt $expectedBlocks) { "FAIL: 只拦了 $blockCount 次（假客户端弹了 $popCount 次，每次都应该拦）"; $pass = $false }
+else { "ok  : 拦了 $blockCount 次（假客户端一共弹了 $popCount 次，每次都被拦）" }
+if ($suppressed -ge 1) { "注意: 触发了 $suppressed 次「压不动→放弃 15 秒」（说明拦不干净，需看日志）" }
+else { 'ok  : 全部压回去了，没触发放弃拦截' }
 if ($minimizedCount -lt 1) { 'FAIL: 从没识别出"从最小化弹出"' ; $pass = $false } else { "ok  : 识别到从最小化弹出的情况 $minimizedCount 次" }
 # 注：FakeClient 每 1.2 秒会自己再弹一次，所以"结束时前台是谁"没有意义——它就是个死缠烂打的假客户端。
 # 真正要看的是：每次弹出都被拦（上面那条）+ 拦的时候会不会最小化回去（最小化那条）。
@@ -73,3 +75,5 @@ if ($minimizedCount -lt 1) { 'FAIL: 从没识别出"从最小化弹出"' ; $pass
 Stop-Process -Id $guard.Id -Force -ErrorAction SilentlyContinue
 Stop-Process -Id $fake.Id -Force -ErrorAction SilentlyContinue
 "`n结果: " + $(if ($pass) { 'PASS' } else { 'FAIL' })
+# 退出码要能反映成败：批量跑测试的驱动看的是 $LASTEXITCODE，只打印 FAIL 会让整套测试假绿。
+if (-not $pass) { exit 1 }

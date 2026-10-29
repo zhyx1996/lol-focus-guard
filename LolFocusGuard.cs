@@ -262,6 +262,10 @@ namespace LolFocusGuard
         private const int CLICK_GRACE_MS = FocusRules.ClickGraceMs; // 按键按下后多久内算"这次切换是你点的"
         // 任务栏/开始菜单点击的宽限：从按下到窗口真正激活可能要几百毫秒
         private const int SHELL_CLICK_GRACE_MS = 2500;
+        // 「拦了没压下去」的重试间隔。原来写死 1200ms：同一个窗口再次抢前台会被
+        // ProcessForeground 开头的 hwnd == _lastFgHwnd 提前 return 吞掉，只能靠这个重试兜底，
+        // 所以 1.2 秒就等于「每秒抢 16 次」那种场景下大半时间不设防。
+        private const int RETRY_MS = 400;
         private IntPtr _mouseHook = IntPtr.Zero;
         private IntPtr _kbdHook = IntPtr.Zero;
         private Native.LowLevelHookProc _mouseProc;
@@ -270,7 +274,6 @@ namespace LolFocusGuard
         private string _lastInputWhere = string.Empty; // 鼠标按下时指针压在哪个进程的窗口上
         private int _inputCount;
         private volatile int _inputAgeMs = int.MaxValue; // 最后一次输入距今（系统级，不信钩子）
-        // 防拉锯：同一窗口 10 秒内被拦太多次就放弃拦截 60 秒
         private string _cursorProcNow = "";
         private string _cursorProcPrev = "";
         private DateTime _lastAllowAt = DateTime.MinValue;
@@ -279,9 +282,13 @@ namespace LolFocusGuard
         // 待打回的目标窗口：只有「拦过一次、它又赖在前台」才重试；用户一接管就作废
         private IntPtr _pendingBlockHwnd = IntPtr.Zero;
         private DateTime _pendingBlockAt = DateTime.MinValue;
-        private IntPtr _streakHwnd = IntPtr.Zero;
-        private int _streakCount;
-        private DateTime _streakAt = DateTime.MinValue;
+        // 防拉锯：判据是「我们**压不动**它」，不是「我们拦了几次」。
+        // 成功的拦截一次都不计入；只有动作落地后前台仍被它占着才算一次失败，
+        // 10 秒内连续失败 5 次才放弃 15 秒（原来是按调用次数算，重试也算，等于一次没压住就自废一分钟）。
+        private IntPtr _blockFailHwnd = IntPtr.Zero;
+        private int _blockFailCount;
+        private DateTime _blockFailAt = DateTime.MinValue;
+        private DateTime _lastSuppressedLogAt = DateTime.MinValue;
         private readonly Dictionary<IntPtr, DateTime> _suppressedUntil = new Dictionary<IntPtr, DateTime>();
         // Alt / Win 最后一次按下的时间：这两个键才是"切窗口"用的
         private DateTime _lastModifierAt = DateTime.MinValue;
@@ -450,12 +457,24 @@ namespace LolFocusGuard
                     ProcessForeground(fg, false);
                 }
                 else if (fg != IntPtr.Zero && fg == _pendingBlockHwnd &&
-                         (DateTime.Now - _pendingBlockAt).TotalMilliseconds > 1200)
+                         (DateTime.Now - _pendingBlockAt).TotalMilliseconds > RETRY_MS)
                 {
                     // 打回过一次、它却还赖在前台（上次没压下去）：再试一次。
                     // 但只要你在此期间自己放行过它（点任务栏/点窗口/Alt+Tab），这个待办立刻作废 ——
                     // 否则就是「我点了任务栏把它叫出来，1.2 秒后它又被最小化」，得点好几遍才能切出来。
-                    if (_lastAllowAt > _pendingBlockAt)
+                    //
+                    // 还要防一种时序：你点任务栏想切回客户端，可它的「激活事件」要几百毫秒才到
+                    // （慢客户端尤其明显），这时重试会以 retry=true 跑 ProcessForeground，
+                    // 而 retry 分支强制忽略点击证据 → 把你正要打开的窗口又压回去。
+                    // 所以判据是「这次拦截**之后**你有没有按过鼠标/Alt/Win」，而不是「最近有没有输入」；
+                    // 并且按下的落点得像个切换动作（任务栏，或目标进程的窗口）。
+                    bool userTakingOver =
+                        (_lastClickAt > _pendingBlockAt &&
+                         (DateTime.Now - _lastClickAt).TotalMilliseconds <= SHELL_CLICK_GRACE_MS &&
+                         (IsTaskbarClass(_lastClickClass) || _targets.Contains(_lastClickWhere))) ||
+                        (_lastModifierAt > _pendingBlockAt);
+
+                    if (_paused || _lastAllowAt > _pendingBlockAt || userTakingOver)
                     {
                         _pendingBlockHwnd = IntPtr.Zero;
                     }
@@ -1093,6 +1112,14 @@ namespace LolFocusGuard
                     _lastAllowProc = proc;
                     // 你接管了这个窗口：任何"打回它"的待办立刻作废
                     _pendingBlockHwnd = IntPtr.Zero;
+                    // 连"连续弹"的判定也一起作废：用户接管过，下一次再拦就不该按连续弹处理
+                    _lastBlockedHwnd = IntPtr.Zero;
+                    lock (_sync)
+                    {
+                        _blockFailHwnd = IntPtr.Zero;
+                        _blockFailCount = 0;
+                        _blockFailAt = DateTime.MinValue;
+                    }
                     return;
                 }
 
@@ -1122,9 +1149,17 @@ namespace LolFocusGuard
                     break;
                 case DecisionCode.AllowSuppressed:
                     if (_verbose) Log("放行原因: 正在放弃拦截期（刚才拦太多次）");
+                    else if ((DateTime.Now - _lastSuppressedLogAt).TotalSeconds > 3)
+                    {
+                        // 放弃拦截期里也必须留证据：不然用户只看到"弹窗又出来了"，
+                        // 会以为守卫没在跑（这条原来在非 verbose 下完全静默）。
+                        _lastSuppressedLogAt = DateTime.Now;
+                        Log(string.Format("放弃拦截期内放行（不再压回去）：{0}（pid={1}，标题=\"{2}\"）",
+                            ProcNameOfCached(hwnd), ProcIdOf(hwnd), TitleOf(hwnd)));
+                    }
                     break;
                 case DecisionCode.AllowJustAllowed:
-                    if (_verbose) Log("放行原因: 刚放行过这个窗口（800ms 内不重复压回去）");
+                    if (_verbose) Log("放行原因: 刚放行过这个窗口（" + JUST_ALLOWED_MS + "ms 内不重复压回去）");
                     break;
                 case DecisionCode.AllowModifier:
                     if (_verbose) Log("放行原因: Alt/Win 切换");
@@ -1261,37 +1296,16 @@ namespace LolFocusGuard
             DateTime now = DateTime.Now;
             if ((now - _lastBlockRequestAt).TotalMilliseconds < 80) return; // 防重入抖动
             _lastBlockRequestAt = now;
+            // 先取旧值再更新：escalating 要算的正是"上一次拦截到现在隔了多久"。
+            // 之前是先 _lastBlockAt = now 再取，差值恒为 0，于是任何窗口被拦过第二次就永远
+            // 被当成"连续弹"（而且 _lastBlockedHwnd 永不复位），一直走最强硬的最小化路径。
+            DateTime previousBlockAt = _lastBlockAt;
             _lastBlockAt = now;
-
-            // 同一个窗口在 10 秒内被拦太多次（比如它是个模态框、一直往回抢）：
-            // 再拦下去就是跟它来回拉锯，机器会变得很难用。这时放弃拦截 60 秒并记一笔，
-            // 宁可让它弹一次，也不能把正常使用卡死。
-            if (hwnd == _streakHwnd && (now - _streakAt).TotalSeconds <= 10)
-            {
-                _streakCount++;
-            }
-            else
-            {
-                _streakHwnd = hwnd;
-                _streakCount = 1;
-                _streakAt = now;
-            }
-            if (_streakCount > 5)
-            {
-                lock (_sync) { _suppressedUntil[hwnd] = now.AddSeconds(60); }
-                _streakCount = 0;
-                Log(string.Format("放弃拦截 60 秒：{0}（pid={1}，标题=\"{2}\"）10 秒内抢了 6 次前台，再拦就是跟它拉锯了",
-                    ProcNameOfCached(hwnd), ProcIdOf(hwnd), TitleOf(hwnd)));
-                return;
-            }
 
             int number = ++_blockCount;
 
             // 同一窗口在 2 秒内又来抢前台 → 说明只把焦点还回去不够（它自己还会再弹），
             // 直接最小化掉，别跟它来回拉锯。
-            // 注意顺序：必须先用旧值算「间隔」，再更新 _lastBlockAt ——
-            // 之前是先更新再算，导致这个判断几乎永远成立（同一个窗口隔多久都会被当成"连续弹"）。
-            DateTime previousBlockAt = _lastBlockAt;
             bool escalating = (hwnd == _lastBlockedHwnd) &&
                               (now - previousBlockAt).TotalMilliseconds < 2000;
             _lastBlockedHwnd = hwnd;
@@ -1372,12 +1386,66 @@ namespace LolFocusGuard
                             Log("打回失败: 前台没能交还（目标窗口还占着前台）");
                         }
                     }
+
+                    // 验收这次动作到底有没有把它从前台赶走（见 RecordBlockResult 的注释）。
+                    RecordBlockResult(hwnd);
                 }
                 catch (Exception ex)
                 {
                     Log("拦截失败: " + ex.Message);
                 }
             });
+        }
+
+        /// <summary>
+        /// 拦截动作落地后的验收：前台是不是真的不在它手上了。
+        ///
+        /// 防拉锯的判据必须是「我们**压不动**它」，不是「我们拦了几次」。原来每调一次 Block
+        /// 就计数（重试也算一次），结果是：一次没压住 + 几次 1.2s 重试 → 7 秒内凑满 6 次 →
+        /// 这个窗口 60 秒免疫，等于把用户扔给弹窗一分钟。现在：
+        ///   · 压下去了 → 失败计数清零（正常的"它抢一次、我们拦一次"永远累不到放弃）；
+        ///   · 压不下去 → 记一次失败，10 秒内连续 5 次才放弃；
+        ///   · 放弃期 15 秒（原来 60 秒），而且放弃期内每次仍然写日志（见 LogDecision）。
+        /// </summary>
+        private void RecordBlockResult(IntPtr hwnd)
+        {
+            if (Native.GetForegroundWindow() != hwnd)
+            {
+                lock (_sync)
+                {
+                    _blockFailHwnd = IntPtr.Zero;
+                    _blockFailCount = 0;
+                    _blockFailAt = DateTime.MinValue;
+                }
+                return;
+            }
+
+            bool giveUp = false;
+            DateTime now = DateTime.Now;
+            lock (_sync)
+            {
+                if (hwnd != _blockFailHwnd || (now - _blockFailAt).TotalSeconds > 10)
+                {
+                    _blockFailHwnd = hwnd;
+                    _blockFailAt = now;
+                    _blockFailCount = 0;
+                }
+                _blockFailCount++;
+                if (_blockFailCount >= 5)
+                {
+                    _suppressedUntil[hwnd] = now.AddSeconds(15);
+                    _blockFailCount = 0;
+                    _blockFailAt = DateTime.MinValue;
+                    _blockFailHwnd = IntPtr.Zero;
+                    giveUp = true;
+                }
+            }
+
+            if (giveUp)
+            {
+                Log(string.Format("放弃拦截 15 秒：{0}（pid={1}，标题=\"{2}\"）10 秒内 5 次都没能把前台从它手上拿回来，再拦就是跟它拉锯了",
+                    ProcNameOfCached(hwnd), ProcIdOf(hwnd), TitleOf(hwnd)));
+            }
         }
 
         private void ForceForeground(IntPtr hwnd)

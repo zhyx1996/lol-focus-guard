@@ -180,3 +180,5 @@ Stop-Process -Id $guard.Id -Force -ErrorAction SilentlyContinue
 Stop-Process -Id $pt.Id -Force -ErrorAction SilentlyContinue
 Stop-Process -Id $bg.Id -Force -ErrorAction SilentlyContinue
 "`n结果: " + $(if ($pass) { 'PASS' } else { 'FAIL' })
+# 退出码要能反映成败：批量跑测试的驱动看的是 $LASTEXITCODE，只打印 FAIL 会让整套测试假绿。
+if (-not $pass) { exit 1 }
