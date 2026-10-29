@@ -2071,10 +2071,7 @@ namespace LolFocusGuard
                             Native.SwitchToThisWindow(restore, false); // 最后的兜底
                             System.Threading.Thread.Sleep(10);
                         }
-                        if (_verbose && Native.GetForegroundWindow() == hwnd)
-                        {
-                            Log("打回失败: 前台没能交还（目标窗口还占着前台）");
-                        }
+                        // 这里**不判成败**：按住循环还会再压几次，成败要在那之后判（见下面的"打回结果"）
                     }
 
                     // ---- 按住：对"对局就绪"这种会在几十毫秒内把自己顶回来的窗口 ----
@@ -2107,6 +2104,22 @@ namespace LolFocusGuard
                             Native.PostMessage(hwnd, Native.WM_SYSCOMMAND, (IntPtr)Native.SC_MINIMIZE, IntPtr.Zero);
                         }
                         if (restore != IntPtr.Zero && Native.IsWindow(restore)) ForceForeground(restore);
+                    }
+                    // ---- 打回结果：按住之后才判"到底压住没有" ----
+                    // 为什么挪到这里：以前在"交还前台"那一步就写「打回失败」，可按住循环还会再压 300ms，
+                    // 真机上大量出现"报了打回失败、其实后面压住了"，把验收报告（verify-real 的
+                    // 「前台没能交还 N 次」）整个污染掉。现在只有**按住也结束、它仍占着前台且没最小化**
+                    // 才算真失败；已最小化就算压住了（屏幕没被占）。
+                    if (_verbose && Native.GetForegroundWindow() == hwnd)
+                    {
+                        if (Native.IsIconic(hwnd))
+                        {
+                            Log("打回结果: 前台名义上还挂着它，但它已最小化（屏幕没被占）→ 算压住了");
+                        }
+                        else
+                        {
+                            Log("打回失败: 前台没能交还，它也没被最小化（真没压下去）");
+                        }
                     }
                     if (_verbose && holds > 0)
                     {
