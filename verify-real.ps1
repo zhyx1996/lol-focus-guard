@@ -52,24 +52,59 @@ $heartbeats = 0
 $unlockAllows = 0
 $wegameLoginAllows = 0
 $switchEvents = 0
+# 「刚点开又被压回去」的复发：放行某个窗口之后 1.2 秒内，同一个窗口又被拦截
+$relapse = 0
+$relapseSamples = @()
+# 同一个窗口 10 秒内被拦 >= 5 次（拉锯）
+$burstWindows = @{}
+$lastAllowAt = $null; $lastAllowProc = ''
+$lastFgProc = ''
+$blockTimes = @{}
 
 foreach ($raw in $all) {
     $line = [string]$raw
     if ($line.Length -lt 26) { continue }
+    $tsNow = $null
     if ($line[0] -eq '[') {
         $t = $line.Substring(1, 23)
         if ($null -eq $firstTime) { $firstTime = $t }
         $lastTime = $t
+        try { $tsNow = [datetime]::ParseExact($t, 'yyyy-MM-dd HH:mm:ss.fff', $null) } catch { $tsNow = $null }
     }
 
+    if ($line -match '前台变化 → ([^\s(]+)') { $lastFgProc = $Matches[1]; continue }
     if ($line -match '拦截 #\d+：([^\s(]+)') {
         $w = $Matches[1]
         if ($blockByWindow.ContainsKey($w)) { $blockByWindow[$w]++ } else { $blockByWindow[$w] = 1 }
+        # 复发检测：刚放行过这个窗口，1.2 秒内又被压回去 = 用户最痛的那个症状
+        if ($null -ne $tsNow -and $null -ne $lastAllowAt -and $w -eq $lastAllowProc) {
+            $delta = ($tsNow - $lastAllowAt).TotalMilliseconds
+            if ($delta -ge 0 -and $delta -le 1200) {
+                $relapse++
+                if ($relapseSamples.Count -lt 3) {
+                    $relapseSamples += ("{0} → {1}，间隔 {2}ms" -f $lastAllowAt.ToString('HH:mm:ss.fff'), $tsNow.ToString('HH:mm:ss.fff'), [int]$delta)
+                }
+            }
+        }
+        # 拉锯检测：同一个窗口 10 秒内被拦 >= 5 次，说明压不住、一直在打
+        if ($null -ne $tsNow) {
+            if (-not $blockTimes.ContainsKey($w)) { $blockTimes[$w] = @() }
+            $recent = @($blockTimes[$w] | Where-Object { ($tsNow - $_).TotalMilliseconds -le 10000 })
+            $recent += $tsNow
+            $blockTimes[$w] = $recent
+            if ($recent.Count -ge 5) { $burstWindows[$w] = $true }
+        }
         continue
     }
     if ($line -match '放行原因: ([^（]+)') {
         $r = $Matches[1].Trim()
         if ($allowReasons.ContainsKey($r)) { $allowReasons[$r]++ } else { $allowReasons[$r] = 1 }
+        # 记下"这次放的是谁"：放行行本身不带进程名，靠上一行「前台变化 → <proc>」配对
+        # （普通日志没有「前台变化」行，所以复发检测只在 --verbose 日志上有效）
+        if ($null -ne $tsNow -and $lastFgProc -ne '') {
+            $lastAllowAt = $tsNow
+            $lastAllowProc = $lastFgProc
+        }
         continue
     }
     if ($line -match '放弃拦截 15 秒') { $giveUp++; continue }
@@ -118,6 +153,13 @@ if ($totalAllows -eq 0) { '  （普通日志只记部分放行原因，想看全
 "客户端启动/退出: $clientStarts / $clientStops 段" + $(if ($sessionBlocks.Count -gt 0) { "，各段拦截分别: $($sessionBlocks -join ', ') 次" } else { '' })
 if ($wegameLoginAllows -gt 0) { "WeGame 登录阶段放行: $wegameLoginAllows 次" }
 if ($unlockAllows -gt 0) { "解锁/恢复会话放行: $unlockAllows 次" }
+if ($relapse -gt 0) {
+    "刚放行又被压回去（1.2 秒内同窗口再拦）: $relapse 次 —— 这就是『得切好几遍』那个症状"
+    foreach ($rs in $relapseSamples) { "  $rs" }
+}
+if ($burstWindows.Count -gt 0) {
+    "10 秒内同一窗口被拦 ≥5 次（压不住、在拉锯）: " + (($burstWindows.Keys) -join ', ')
+}
 "放弃拦截（10 秒内 5 次压不动 → 停手 15 秒）: $giveUp 次"
 "取消拦截（排队后才发现你已经接管）: $cancel 次"
 if ($cancel -gt 0) {
@@ -160,6 +202,12 @@ if ($clickAllows -gt 0) {
     '· 这段没有手动切换记录，② 这次没法验证'
 }
 
+if ($relapse -gt 0) {
+    "✗ 有 $relapse 次『你刚把它叫出来、1.2 秒内又被压回去』 —— 这正是最痛的那个症状，属于必须修：把带这几次时间点的日志发我"
+}
+if ($burstWindows.Count -gt 0) {
+    "! 有窗口 10 秒内被拦 ≥5 次：它在反复抢、我们反复压（拉锯）。把这段日志发我，看是不是该放弃得更早/换更硬的手段"
+}
 if ($giveUp -gt 0) {
     "! 有 $giveUp 次「放弃拦截」：说明连续 5 次没能把前台拿回来，那 15 秒里它是被放行的。把这份日志发我，我按具体窗口查为什么压不动"
 }
@@ -169,7 +217,7 @@ if ($cancel -gt 0) {
 if ($blockFail -gt 0) {
     "! 有 $blockFail 次「打回失败」：窗口没被最小化掉（可能被系统策略挡住），发我这段日志"
 }
-if ($giveUp -eq 0 -and $cancel -eq 0 -and $blockFail -eq 0 -and $totalBlocks -gt 0) {
+if ($giveUp -eq 0 -and $cancel -eq 0 -and $blockFail -eq 0 -and $relapse -eq 0 -and $burstWindows.Count -eq 0 -and $totalBlocks -gt 0) {
     '✓ 没有放弃拦截、没有取消拦截、没有打回失败 —— 拦得干净'
 }
 if (-not $VerboseLog -and $heartbeats -eq 0) {
