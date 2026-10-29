@@ -1831,7 +1831,7 @@ namespace LolFocusGuard
                     }
 
                     // 验收这次动作到底有没有把它从前台赶走（见 RecordBlockResult 的注释）。
-                    RecordBlockResult(hwnd);
+                    RecordBlockResult(hwnd, requestAt);
                 }
                 catch (Exception ex)
                 {
@@ -1872,19 +1872,13 @@ namespace LolFocusGuard
             //   · 游戏里右键走位（每秒好几次）、点桌面、点聊天框，都是"按下了鼠标"，
             //     但不是"你要切窗口" —— 拿它们取消拦截，真机表现就是「偶发漏拦」；
             //   · LoL 里 Alt+Q/W/E/R 是自施法，Alt 按得极频繁，同理不能当接管证据。
-            double reqAge = Clock.AgeMs(requestAt);
-            double clickAge = Clock.AgeMs(_lastClickAt);
-            bool clickNewer = clickAge < reqAge;
-            bool shellEntry = clickNewer && IsShellProcess(_lastClickWhere) && IsShellClickClass(_lastClickClass);
-            bool targetWindow = clickNewer && _targets.Contains(_lastClickWhere);
-            double modifierAge = Clock.AgeMs(_lastModifierAt);
-            bool winPressed = modifierAge < reqAge && _lastModifierWasWin;
-
-            if (FocusRules.IsSwitchGesture(shellEntry, targetWindow, winPressed))
+            if (UserSwitchedSince(requestAt))
             {
-                if (winPressed)
+                double clickAge = Clock.AgeMs(_lastClickAt);
+                double modifierAge = Clock.AgeMs(_lastModifierAt);
+                if (_lastModifierWasWin && modifierAge < Clock.AgeMs(requestAt))
                     why = string.Format("排队之后你按了 Win（{0}ms前）", modifierAge);
-                else if (shellEntry)
+                else if (IsShellProcess(_lastClickWhere) && IsShellClickClass(_lastClickClass))
                     why = string.Format("排队之后你点了任务栏/开始菜单类入口（{0:0}ms前，class={1}）",
                         clickAge, _lastClickClass.Length > 0 ? _lastClickClass : "?");
                 else
@@ -1903,6 +1897,26 @@ namespace LolFocusGuard
                 return false;
             }
             return true;
+        }
+
+        /// <summary>
+        /// 从某个时刻到现在，你有没有做过"像切窗口"的动作（点任务栏/缩略图/托盘/开始菜单、
+        /// 点了被监控的窗口、按了 Win）。
+        ///
+        /// 两处共用（都要求"认落点、只认 Win"，见 FocusRules.IsSwitchGesture）：
+        ///   1) 排队的最小化动作动手前复核；
+        ///   2) 拦截之后验收"压没压住"时，区分"我们压不动"和"是你自己把它又叫回来了"。
+        /// </summary>
+        private bool UserSwitchedSince(long sinceMs)
+        {
+            double sinceAge = Clock.AgeMs(sinceMs);
+            double clickAge = Clock.AgeMs(_lastClickAt);
+            bool clickNewer = clickAge < sinceAge;
+            bool shellEntry = clickNewer && IsShellProcess(_lastClickWhere) && IsShellClickClass(_lastClickClass);
+            bool targetWindow = clickNewer && _targets.Contains(_lastClickWhere);
+            double modifierAge = Clock.AgeMs(_lastModifierAt);
+            bool winPressed = modifierAge < sinceAge && _lastModifierWasWin;
+            return FocusRules.IsSwitchGesture(shellEntry, targetWindow, winPressed);
         }
 
         /// <summary>
@@ -1946,8 +1960,11 @@ namespace LolFocusGuard
         ///   · 压下去了 → 失败计数清零（正常的"它抢一次、我们拦一次"永远累不到放弃）；
         ///   · 压不下去 → 记一次失败，10 秒内连续 5 次才放弃；
         ///   · 放弃期 15 秒（原来 60 秒），而且放弃期内每次仍然写日志（见 LogDecision）。
+        ///   · **你把它叫回来的不算我们压不动**：如果打回之后你点了任务栏/点它/按了 Win，
+        ///     那"它又在前台"是你的动作，不是我们压不住 —— 算成失败的话，你连着几次
+        ///     想把它叫出来，就会凑满 5 次"失败"→ 放弃拦截 15 秒，反而把真正的自弹放进来。
         /// </summary>
-        private void RecordBlockResult(IntPtr hwnd)
+        private void RecordBlockResult(IntPtr hwnd, long requestAt)
         {
             if (Native.GetForegroundWindow() != hwnd)
             {
@@ -1957,6 +1974,19 @@ namespace LolFocusGuard
                     _blockFailCount = 0;
                     _blockFailAt = Clock.Never;
                 }
+                return;
+            }
+
+            // 是你自己把它叫回来的 → 清零失败计数，别让"你想用它"变成"我们压不动"。
+            if (UserSwitchedSince(requestAt))
+            {
+                lock (_sync)
+                {
+                    _blockFailHwnd = IntPtr.Zero;
+                    _blockFailCount = 0;
+                    _blockFailAt = Clock.Never;
+                }
+                if (_verbose) Log("打回之后你自己把它叫回来了（点了任务栏/它本身，或按了 Win），这次不算压不动");
                 return;
             }
 
