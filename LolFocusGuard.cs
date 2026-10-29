@@ -1959,17 +1959,26 @@ namespace LolFocusGuard
                     // 为什么要记：如果它弹的是"对局已就绪/接受对局"这种要你点一下的东西，
                     // 我们把它打回等于让你错过对局。现在先只记录证据，不改判定 ——
                     // 等真机日志里出现了，再决定要不要对这种情况特殊处理。
+                    // IsWindowEnabled=False = 这个窗口上有模态对话框（子窗口先接管输入）。
+                    // GW_ENABLEDPOPUP 再把那个模态子窗口指出来（没有就返回它自己）。
+                    //
+                    // 这个标志不只用于诊断，还决定怎么打回：模态窗口（典型就是"对局已就绪/
+                    // 接受对局"那个必须点一下的框）**只抢回前台、不最小化** ——
+                    // 最小化会把它藏进任务栏，你就可能真的错过这一局；留在后面则两全：
+                    // 前台还给你的窗口（不抢焦点），它自己也还在，随时点任务栏就能接受。
+                    bool modalWindow = false;
+                    try { modalWindow = !Native.IsWindowEnabled(hwnd); }
+                    catch
+                    {
+                    }
                     if (_verbose)
                     {
                         try
                         {
-                            // IsWindowEnabled=False = 这个窗口上有模态对话框（子窗口先接管输入）。
-                            // GW_ENABLEDPOPUP 再把那个模态子窗口指出来（没有就返回它自己）。
-                            if (!Native.IsWindowEnabled(hwnd))
+                            if (modalWindow)
                             {
                                 IntPtr popup = Native.GetWindow(hwnd, Native.GW_ENABLEDPOPUP);
-                                Log(string.Format("诊断：这个窗口打回时不可交互（IsWindowEnabled=False，模态子窗口={0}）——" +
-                                    "可能正在显示必须点的弹窗，如果真机上因此漏掉对局，就靠这条日志定位",
+                                Log(string.Format("这个窗口带着模态弹窗（IsWindowEnabled=False，模态子窗口={0}）→ 只抢回前台，不最小化",
                                     popup == IntPtr.Zero ? "无" : popup.ToString()));
                             }
                         }
@@ -1985,7 +1994,9 @@ namespace LolFocusGuard
 
                     // 没有可以交还的窗口时（比如上一个前台窗口本身也在监控名单里），
                     // 光"不还焦点"等于什么都没做，那就直接把它最小化掉，让系统自己挑下一个窗口。
-                    if (wasMinimized || restore == IntPtr.Zero)
+                    // 模态窗口（对局就绪那种必须点一下的框）只要有窗口可以交还，就不最小化：
+                    // 最小化会把它藏进任务栏，你可能真的错过这一局。留在后面 + 前台还给你 = 两全。
+                    if ((wasMinimized || restore == IntPtr.Zero) && !(modalWindow && restore != IntPtr.Zero))
                     {
                         Native.ShowWindow(hwnd, SW_MINIMIZE);
                         System.Threading.Thread.Sleep(5);
@@ -2073,13 +2084,18 @@ namespace LolFocusGuard
                         if (_switchCredentialAt != Clock.Never && _switchCredentialAt >= holdStart) break;
                         if (Native.GetForegroundWindow() != hwnd) break;
                         holds++;
-                        Native.ShowWindow(hwnd, SW_MINIMIZE);
-                        Native.PostMessage(hwnd, Native.WM_SYSCOMMAND, (IntPtr)Native.SC_MINIMIZE, IntPtr.Zero);
+                        // 模态窗口（对局就绪那种）不最小化，只把前台抢回来：留着它你还能受理
+                        if (!modalWindow)
+                        {
+                            Native.ShowWindow(hwnd, SW_MINIMIZE);
+                            Native.PostMessage(hwnd, Native.WM_SYSCOMMAND, (IntPtr)Native.SC_MINIMIZE, IntPtr.Zero);
+                        }
                         if (restore != IntPtr.Zero && Native.IsWindow(restore)) ForceForeground(restore);
                     }
                     if (_verbose && holds > 0)
                     {
-                        Log(string.Format("按住：它又抢了 {0} 次前台，都压回去了（{1}ms 内）", holds, HOLD_DOWN_TOTAL_MS));
+                        Log(string.Format("按住：它又抢了 {0} 次前台，都压回去了（{1}ms 内{2}）",
+                            holds, HOLD_DOWN_TOTAL_MS, modalWindow ? "，模态窗口只抢前台不最小化" : ""));
                     }
 
                     // 验收这次动作到底有没有把它从前台赶走（见 RecordBlockResult 的注释）。
