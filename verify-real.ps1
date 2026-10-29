@@ -59,6 +59,7 @@ $relapseSamples = @()
 $burstWindows = @{}
 $lastAllowAt = $null; $lastAllowProc = ''
 $lastFgProc = ''
+$fgChangeLines = 0
 $blockTimes = @{}
 
 foreach ($raw in $all) {
@@ -72,7 +73,7 @@ foreach ($raw in $all) {
         try { $tsNow = [datetime]::ParseExact($t, 'yyyy-MM-dd HH:mm:ss.fff', $null) } catch { $tsNow = $null }
     }
 
-    if ($line -match '前台变化 → ([^\s(]+)') { $lastFgProc = $Matches[1]; continue }
+    if ($line -match '前台变化 → ([^\s(]+)') { $lastFgProc = $Matches[1]; $fgChangeLines++; continue }
     if ($line -match '拦截 #\d+：([^\s(]+)') {
         $w = $Matches[1]
         if ($blockByWindow.ContainsKey($w)) { $blockByWindow[$w]++ } else { $blockByWindow[$w] = 1 }
@@ -129,6 +130,26 @@ foreach ($raw in $all) {
     if ($line -match '放行 WeGame 窗口（登录阶段') { $wegameLoginAllows++; continue }
 }
 
+# ---------- 第二遍：你没有任何输入时，谁把前台抢走了（只有 --verbose 日志有「前台变化」行） ----------
+# 这是"漏网目标"的发现手段：如果某个窗口在你没输入时抢了前台、而它又没被拦，
+# 说明它不在目标名单里 —— 名字就在这一行的 proc/class/标题里。
+$stealers = [ordered]@{}
+$shellProcs = @('explorer', 'StartMenuExperienceHost', 'ShellExperienceHost', 'SearchHost', 'LolFocusGuard', '')
+$prevProc = ''; $prevTitle = ''
+foreach ($raw in $all) {
+    $line = [string]$raw
+    if ($line -notmatch '前台变化 → ([^\s(]+) \(pid=\d+\) class=([^\s]+) 标题="([^"]*)" 尺寸=(\S+) 最小化=(\w+) 按键=(.+)$') { continue }
+    $proc = $Matches[1]; $cls = $Matches[2]; $title = $Matches[3]; $size = $Matches[4]; $minimized = $Matches[5]; $keyInfo = $Matches[6]
+    $idle = ($keyInfo -match '没按过或已用掉')
+    $fromReal = ($prevProc -ne '' -and ($shellProcs -notcontains $prevProc))
+    $isMinimizeArtifact = ($size -like '-32000*' -or $minimized -eq 'True' -or $size -like '0x0*')
+    if ($idle -and $fromReal -and $proc -ne $prevProc -and ($shellProcs -notcontains $proc) -and -not $isMinimizeArtifact) {
+        $k = "$proc  class=$cls  标题=""$title"""
+        if ($stealers.Contains($k)) { $stealers[$k]++ } else { $stealers[$k] = 1 }
+    }
+    $prevProc = $proc; $prevTitle = $title
+}
+
 $totalBlocks = 0
 foreach ($k in $blockByWindow.Keys) { $totalBlocks += $blockByWindow[$k] }
 $totalAllows = 0
@@ -148,11 +169,23 @@ if ($totalBlocks -eq 0) { '  （这次一段都没拦 —— 见下面判定）'
 foreach ($k in ($allowReasons.GetEnumerator() | Sort-Object -Property Value -Descending)) {
     "  $($k.Key) ×$($k.Value)"
 }
-if ($totalAllows -eq 0) { '  （普通日志只记部分放行原因，想看全给 --verbose 跑一局）' }
+if ($totalAllows -eq 0) {
+    if ($fgChangeLines -gt 0 -or $heartbeats -gt 0) { '  （这局一次放行都没记录到 —— 如果它确实弹过、你也手动切过，那不正常，发我日志）' }
+    else { '  （普通日志只记部分放行原因，想看全给 --verbose 跑一局）' }
+}
 ''
 "客户端启动/退出: $clientStarts / $clientStops 段" + $(if ($sessionBlocks.Count -gt 0) { "，各段拦截分别: $($sessionBlocks -join ', ') 次" } else { '' })
 if ($wegameLoginAllows -gt 0) { "WeGame 登录阶段放行: $wegameLoginAllows 次" }
 if ($unlockAllows -gt 0) { "解锁/恢复会话放行: $unlockAllows 次" }
+if ($stealers.Count -gt 0) {
+    '疑似"没被拦住"的抢前台（你没有任何输入时把前台抢走的窗口）:'
+    foreach ($k in ($stealers.GetEnumerator() | Sort-Object -Property Value -Descending)) {
+        # 这一段该进程被拦过几次（按进程名粗配）
+        $pname = ($k.Key -split '  ')[0]
+        $b = 0; if ($blockByWindow.ContainsKey($pname)) { $b = $blockByWindow[$pname] }
+        "  $($k.Key) ×$($k.Value)（这段被拦 $b 次）"
+    }
+}
 if ($relapse -gt 0) {
     "刚放行又被压回去（1.2 秒内同窗口再拦）: $relapse 次 —— 这就是『得切好几遍』那个症状"
     foreach ($rs in $relapseSamples) { "  $rs" }
@@ -202,6 +235,22 @@ if ($clickAllows -gt 0) {
     '· 这段没有手动切换记录，② 这次没法验证'
 }
 
+# 有"没输入却抢到前台、且这段一次没被拦"的窗口 → 可能漏网目标
+# 只看"长得像 LoL/WeGame 那一族"的：游戏自己回前台（比如你在玩的另一个游戏）不算漏网。
+$unblockedStealers = @()
+foreach ($k in $stealers.Keys) {
+    $pname = ($k -split '  ')[0]
+    $looksLikeTarget = ($pname -match '^(LeagueClientUx|LeagueClient|RiotClientServices|wegame|wegame_env|pallas|Client|Tencent|tgp)$') -or
+                       ($k -match 'WeGame') -or ($k -match 'League')
+    if (-not $looksLikeTarget) { continue }
+    $b = 0; if ($blockByWindow.ContainsKey($pname)) { $b = $blockByWindow[$pname] }
+    if ($b -eq 0 -and $stealers[$k] -ge 2) { $unblockedStealers += $k }
+}
+if ($unblockedStealers.Count -gt 0) {
+    "! 有像客户端/WeGame 的窗口在你没输入时抢了前台、这段一次都没被拦：" + ($unblockedStealers -join '；')
+    '  如果客户端当时在跑，这就是漏网的目标（名字就在上面那行里）→ 把这段日志发我，我加进识别；'
+    '  如果客户端还没起来（WeGame 登录阶段），按设计就是放行。'
+}
 if ($relapse -gt 0) {
     "✗ 有 $relapse 次『你刚把它叫出来、1.2 秒内又被压回去』 —— 这正是最痛的那个症状，属于必须修：把带这几次时间点的日志发我"
 }
