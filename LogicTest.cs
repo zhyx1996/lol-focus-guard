@@ -124,23 +124,48 @@ internal static class LogicTest
         f.Suppressed = true;
         Case("正在防拉锯放弃期 → 放行（不再跟它拉锯）", f, true, DecisionCode.AllowSuppressed);
 
-        // ---- 放行：刚放行过的窗口 ----
+        // ---- 放行：刚放行过的窗口（同一个 hwnd，3 秒） ----
         // 真机上踩到的：你点了客户端（放行），客户端内部又自己抢了一次焦点，
-        // 800ms 内再压回去的观感就是"我刚点开你就给我最小化"。
+        // 3 秒内再压回去的观感就是"我刚点开你就给我最小化"。
         f = Idle();
-        f.RecentlyAllowed = true;
-        Case("刚放行过的窗口又自己抢前台（800ms 内）→ 放行，不再压回去", f, true, DecisionCode.AllowJustAllowed);
+        f.SameWindowJustAllowed = true;
+        Case("同一个窗口刚放行过（3 秒内）→ 放行，不再压回去", f, true, DecisionCode.AllowJustAllowed);
 
         f = Idle();
-        f.RecentlyAllowed = true;
+        f.SameWindowJustAllowed = true;
         f.ClickAgeMs = 100;
         f.ClickOnTarget = false;
-        Case("刚放行过（800ms 内）优先于「按在别处」→ 仍放行", f, true, DecisionCode.AllowJustAllowed);
+        Case("同窗口刚放行过（3 秒内）优先于「按在别处」→ 仍放行", f, true, DecisionCode.AllowJustAllowed);
 
         f = Idle();
-        f.RecentlyAllowed = true;
+        f.SameWindowJustAllowed = true;
         f.TestModeOnly = true;
         Case("测试模式优先于「刚放行过」→ 还是拦", f, false, DecisionCode.BlockTestMode);
+
+        // ---- 放行：同进程**另一个窗口**只给 600ms，且客户端新造的窗口一点都不给 ----
+        f = Idle();
+        f.SameProcJustAllowed = true;
+        Case("同进程、之前见过的另一个窗口，刚放行过（600ms 内）→ 放行", f, true, DecisionCode.AllowJustAllowedProc);
+
+        f = Idle();
+        f.SameProcJustAllowed = false;  // Guard 侧：900ms 已经超过 600ms，这个 fact 不会被置上
+        f.ClickAgeMs = 900;
+        Case("客户端在跑，你 900ms 前点过它，现在它自弹 → 拦（同进程宽限只有 600ms）", f, false, DecisionCode.BlockNoClick);
+
+        f = Idle();
+        f.SameProcJustAllowed = false;  // Guard 侧：新 hwnd 的 knownBefore=false，永远不会置这个 fact
+        f.ClickAgeMs = 200;
+        Case("同进程但是新造的窗口（之前没见过，不享受同进程宽限）→ 不因宽限放行", f, false, DecisionCode.BlockClickElsewhere);
+
+        // ---- 边界：同一个 hwnd 的 3 秒防线不能被拆档改坏 ----
+        f = Idle();
+        f.SameWindowJustAllowed = true;
+        Case("同一个窗口刚放行过（2.9 秒，防线边界内）→ 仍放行", f, true, DecisionCode.AllowJustAllowed);
+
+        f = Idle();
+        f.SameWindowJustAllowed = false; // Guard 侧：3010ms >= 3000ms，这个 fact 不会被置上
+        f.ClickAgeMs = 9000;
+        Case("同一个窗口但已过 3 秒（3010ms）→ 不再放行，没按键就拦", f, false, DecisionCode.BlockNoClick);
 
         // ---- 测试模式 ----
         f = Idle();

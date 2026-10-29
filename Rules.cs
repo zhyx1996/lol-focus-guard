@@ -19,8 +19,18 @@ namespace LolFocusGuard
         /// <summary>这个窗口正在"放弃拦截"期里（防拉锯）。</summary>
         public bool Suppressed;
 
-        /// <summary>刚刚才放行过这个窗口（你点了它，客户端内部又抢了一次焦点）。</summary>
-        public bool RecentlyAllowed;
+        /// <summary>
+        /// 刚刚放行过**这个窗口**（3 秒内）：你点了它，它内部又抢了一次焦点。
+        /// 这条是「我刚点开你就给我最小化」的防线，不能动。
+        /// </summary>
+        public bool SameWindowJustAllowed;
+
+        /// <summary>
+        /// 刚刚放行过**同一个程序的另一个窗口**（600ms 内，且那个窗口之前就见过）。
+        /// 只给很短的窗口：再宽就等于"你在客户端里点过任何地方 → 它 3 秒内自弹什么都放行"，
+        /// 「匹配成功」弹窗就是这么漏过去的。客户端新造的窗口不适用这条。
+        /// </summary>
+        public bool SameProcJustAllowed;
 
         /// <summary>上一次按 Alt/Win 距今多少毫秒。</summary>
         public double ModifierIdleMs = double.MaxValue;
@@ -45,6 +55,7 @@ namespace LolFocusGuard
         AllowFirstClientWindow,
         AllowSuppressed,
         AllowJustAllowed,
+        AllowJustAllowedProc,
         AllowModifier,
         AllowPrevWindowGone,
         AllowClickedTarget,
@@ -88,9 +99,14 @@ namespace LolFocusGuard
             // 3) 正在防拉锯的放弃期里
             if (f.Suppressed) return new Decision(true, DecisionCode.AllowSuppressed);
 
-            // 3.5) 刚刚才放行过这个窗口：你点它 → 它内部又自己抢了一次焦点。
+            // 3.5) 刚刚才放行过**这个窗口**：你点它 → 它内部又自己抢了一次焦点。
             //      这里压回去的观感就是"我刚点开你就给我最小化"，所以干脆不压。
-            if (f.RecentlyAllowed) return new Decision(true, DecisionCode.AllowJustAllowed);
+            if (f.SameWindowJustAllowed) return new Decision(true, DecisionCode.AllowJustAllowed);
+
+            // 3.6) 刚刚放行过**同一个程序的另一个窗口**：只给 600ms（Guard 那边还会要求
+            //      "那个 hwnd 之前就见过"）。原来这里是"同进程 3 秒"，等于你在客户端里点过
+            //      聊天框/开始匹配之后，它 3 秒内自弹什么都放行 —— 「匹配成功」弹窗就是这么漏的。
+            if (f.SameProcJustAllowed) return new Decision(true, DecisionCode.AllowJustAllowedProc);
 
             // 4) 刚按过 Alt / Win（切窗口专用键）
             if (f.ModifierIdleMs <= ModifierGraceMs) return new Decision(true, DecisionCode.AllowModifier);

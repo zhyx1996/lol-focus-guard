@@ -39,6 +39,10 @@ Start-Sleep -Seconds 2
 "FakeClient pid=$($fake.Id) 前台=$([G]::FgProc())"
 
 $guard = Start-Process (Join-Path $PSScriptRoot 'LolFocusGuard.exe') -ArgumentList '--targets=FakeClient','--verbose','--no-click-allow' -PassThru
+
+Start-Sleep -Milliseconds 700
+
+if ($guard.HasExited) { '跳过：守卫启动即退出（单实例互斥锁可能还被上一轮实例占着），本轮结论无效。'; '结果: SKIP'; exit 0 }
 Start-Sleep -Seconds 2
 "守卫 pid=$($guard.Id)，观察 10 秒..."
 

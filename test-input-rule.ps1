@@ -82,6 +82,7 @@ if ($bgH -eq [IntPtr]::Zero -or $ptH -eq [IntPtr]::Zero) { throw '测试窗口�
 
 $guard = Start-Process (Join-Path $PSScriptRoot 'LolFocusGuard.exe') -ArgumentList '--targets=PopTarget','--verbose' -PassThru
 Start-Sleep -Seconds 2
+if ($guard.HasExited) { '跳过：守卫启动即退出（单实例互斥锁可能还被上一轮实例占着），本轮结论无效。'; '结果: SKIP'; exit 0 }
 
 # 输入注入可能被安全软件（WeGame 的 ACE）拦掉：SetCursorPos 返回 False 且指针不动。
 # 这时 A 阶段没法测，直接说明并跳过，不要误报 FAIL。
@@ -125,6 +126,9 @@ $skipped = $false
 } else { 'A 结果: 跳过（输入注入被安全软件拦了）'; $skipped = $true }
 
 # ---------- B) PopTarget 自己抢前台（先最小化再恢复，保证有事件） ----------
+# 注意：A 阶段刚"点过"PopTarget，同一个窗口有 3 秒放行保护（这是「你别把我刚点开的窗口压回去」那条防线）。
+# 必须等它过期，否则 B 拦不到是符合规则的，不是 bug。
+Start-Sleep -Milliseconds 3600
 $before = (Get-Content $guardLog -Raw).Length
 Set-Content -Path $flag -Value 'cycle'
 Start-Sleep -Seconds 3

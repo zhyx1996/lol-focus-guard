@@ -300,7 +300,15 @@ namespace LolFocusGuard
         private bool _mouseWasDown;
         private int _clickCount;
         private const int MODIFIER_GRACE_MS = FocusRules.ModifierGraceMs;
-        private const int JUST_ALLOWED_MS = 3000; // 刚放行过的窗口/程序，这段时间内不再压回去（你还在用它）
+        private const int JUST_ALLOWED_MS = 3000; // 刚放行过的**同一个窗口**，这段时间内不再压回去（你还在用它）
+        // 同一个程序**别的窗口**只给 600ms：原来这一档也是 3 秒，等于"你在客户端里点过任何一处，
+        // 它 3 秒内自弹什么都放行"，「匹配成功」弹窗就是从这漏过去的。
+        private const int JUST_ALLOWED_PROC_MS = 600;
+        // 「客户端窗口第一次出现」只在这个进程刚起来时才算（登录页/启动页/安全检测）。
+        // 客户端已经跑了几分钟之后才冒出来的新窗口，不可能是登录页 —— 那就是它自己弹的。
+        private const int FIRST_CLIENT_WINDOW_SECONDS = 120;
+        // 每个客户端进程只放行"第一次出现"这一次（原来每个新 hwnd 都白送一次放行）。
+        private readonly HashSet<int> _knownPids = new HashSet<int>();
 
         public Guard(IEnumerable<string> targets, string logPath, bool verbose, bool noClickAllow,
             string lcuDir)
@@ -689,6 +697,15 @@ namespace LolFocusGuard
                 }
             }
             _clientRunning = running;
+            // 客户端（含启动器）全都退出了 → "每个 pid 只放行一次"的记录清零，
+            // 否则下次客户端重启后万一被系统复用同一个 pid，登录页就再也放行不了了。
+            if (!running)
+            {
+                lock (_sync)
+                {
+                    if (_knownPids.Count > 0) _knownPids.Clear();
+                }
+            }
         }
 
         private void SetLoginState(int state, string reason)
@@ -1073,15 +1090,23 @@ namespace LolFocusGuard
                 // WeGame 的窗口一律放行，不然用户连登录都点不了；
                 // 客户端已经起来之后再冒出来的（"游戏进程已启动"那张卡片）才拦。
                 facts.WeGameLoginPhase = IsWeGameProcess(proc) && !_clientRunning;
+                // 这个 hwnd 在本次判定之前是不是已经见过 —— 必须在 IsFirstClientWindow 之前取，
+                // 因为它会把当前 hwnd 写进 _knownWindows（副作用）。
+                bool knownBefore;
+                lock (_sync) { knownBefore = _knownWindows.Contains(hwnd); }
                 // 注意：这个方法有副作用（记住"这个窗口见过了"），必须调用
                 facts.FirstClientWindow = IsFirstClientWindow(hwnd, proc);
                 facts.Suppressed = IsSuppressed(hwnd);
-                // 刚刚放行过这个窗口（或者同一个程序的窗口）→ 别再压回去
-                // （"我刚点开你就给我最小化"）。3 秒内都算你还在用它。
-                facts.RecentlyAllowed = (hwnd == _lastAllowHwnd ||
-                                         (_lastAllowProc.Length > 0 &&
-                                          string.Equals(proc, _lastAllowProc, StringComparison.OrdinalIgnoreCase))) &&
-                                        (DateTime.Now - _lastAllowAt).TotalMilliseconds < JUST_ALLOWED_MS;
+                // 刚刚放行过 → 别再压回去（"我刚点开你就给我最小化"）。按两种情况分开给：
+                //   · 同一个 hwnd：3 秒（你刚才就在用它，这条是"点不出来"的防线，不能动）；
+                //   · 同进程的**另一个已知窗口**：600ms（再宽就成了"点过客户端任何一处，
+                //    它 3 秒内自弹什么都被放行"；客户端新造的 hwnd 连这条都不给）。
+                double allowAgeMs = (DateTime.Now - _lastAllowAt).TotalMilliseconds;
+                bool sameHwnd = hwnd == _lastAllowHwnd;
+                bool sameProc = !sameHwnd && knownBefore && _lastAllowProc.Length > 0 &&
+                                string.Equals(proc, _lastAllowProc, StringComparison.OrdinalIgnoreCase);
+                facts.SameWindowJustAllowed = sameHwnd && allowAgeMs < JUST_ALLOWED_MS;
+                facts.SameProcJustAllowed = sameProc && allowAgeMs < JUST_ALLOWED_PROC_MS;
                 facts.ModifierIdleMs = (DateTime.Now - _lastModifierAt).TotalMilliseconds;
                 // 「你手动切窗口」的硬证据：鼠标物理按键真的按下了（ClickWatchLoop 每 15ms 采一次），
                 // 以及按下那一刻指针落在谁身上。它自己抢前台的时候一个按键都没有，这条能把两者分开。
@@ -1120,8 +1145,11 @@ namespace LolFocusGuard
                     if (userEvidence)
                     {
                         // 记下"刚刚放行过这个窗口" —— 这是「我刚点开你就给我最小化」的唯一防线。
-                        // （之前这里漏了赋值，导致 RecentlyAllowed 永远是 false、下面的重试也永远放行不了，
+                        // （之前这里漏了赋值，导致"刚放行过"永远是 false、下面的重试也永远放行不了，
                         //   真机上就是"点了任务栏把客户端叫出来，1.2 秒后又被压回去"，得点好几遍。）
+                        // 注意：AllowJustAllowed / AllowJustAllowedProc 不在 userEvidence 里 ——
+                        // 那两种放行本身是"上次放行的余温"，不能用来续期，否则客户端每 2.x 秒
+                        // 自弹一次就能无限续命（真机已复现）。
                         _lastAllowAt = DateTime.Now;
                         _lastAllowHwnd = hwnd;
                         _lastAllowProc = proc;
@@ -1175,7 +1203,10 @@ namespace LolFocusGuard
                     }
                     break;
                 case DecisionCode.AllowJustAllowed:
-                    if (_verbose) Log("放行原因: 刚放行过这个窗口（" + JUST_ALLOWED_MS + "ms 内不重复压回去）");
+                    if (_verbose) Log("放行原因: 刚放行过这个窗口（同一个窗口 " + JUST_ALLOWED_MS + "ms 内不重复压回去）");
+                    break;
+                case DecisionCode.AllowJustAllowedProc:
+                    if (_verbose) Log("放行原因: 同一个程序刚放行过别的窗口（" + JUST_ALLOWED_PROC_MS + "ms 内）");
                     break;
                 case DecisionCode.AllowModifier:
                     if (_verbose) Log("放行原因: Alt/Win 切换");
@@ -1209,6 +1240,18 @@ namespace LolFocusGuard
         /// <summary>
         /// 客户端进程的窗口第一次出现（登录页 / 启动页 / 安全检测）→ 放行。
         /// 只对客户端进程有效：WeGame 的窗口另有规则（客户端没起来时全放行）。
+        ///
+        /// 两个收紧（原来"每个新 hwnd 都放行一次"，客户端每弹一个新窗口就白送一次放行）：
+        ///   1) 每个 pid 只放行一次（一个客户端实例的登录/启动页只有一次）；
+        ///   2) 且这个进程是"刚起来"的（< 120 秒）——已经跑了几分钟的进程再冒出新窗口，
+        ///      不可能是登录页，那就是它自己弹的。
+        ///
+        /// 取进程启动时间可能因为权限/反作弊拿不到：这时退化为"只按 pid 一次"，
+        /// 宁可少拦一次，也不能把登录页拦了（登录页必须放行是硬要求）。
+        ///
+        /// 刻意**不**用 LCU 登录状态当判据：真机实测腾讯版客户端的 lockfile 恒为空文件，
+        /// _loginState 会永远停在"确定未登录(2)"，拿它当放行条件等于把这条收紧完全废掉
+        /// （见 README「为什么不用登录状态判断」）。
         /// </summary>
         private bool IsFirstClientWindow(IntPtr hwnd, string proc)
         {
@@ -1218,12 +1261,40 @@ namespace LolFocusGuard
                 return false;
             }
 
+            uint pidU;
+            Native.GetWindowThreadProcessId(hwnd, out pidU);
+            int pid = (int)pidU;
+
             lock (_sync)
             {
                 if (_knownWindows.Contains(hwnd)) return false;
                 _knownWindows.Add(hwnd);
+                // 这个进程已经放行过一次了 → 之后它的任何新窗口都不算"第一次出现"
+                if (pid != 0 && !_knownPids.Add(pid)) return false;
             }
-            return true;
+
+            int ageSec = ClientProcessAgeSeconds(pid);
+            if (ageSec < 0) return true;      // 拿不到启动时间：退化为"只按 pid 一次"
+            return ageSec <= FIRST_CLIENT_WINDOW_SECONDS;
+        }
+
+        /// <summary>客户端进程已经跑了多少秒；拿不到（没权限/进程已退出）返回 -1。</summary>
+        private static int ClientProcessAgeSeconds(int pid)
+        {
+            if (pid <= 0) return -1;
+            try
+            {
+                using (Process p = Process.GetProcessById(pid))
+                {
+                    double sec = (DateTime.Now - p.StartTime).TotalSeconds;
+                    if (sec < 0 || sec > int.MaxValue) return -1;
+                    return (int)sec;
+                }
+            }
+            catch
+            {
+                return -1;
+            }
         }
 
 

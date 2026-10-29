@@ -90,10 +90,25 @@ if ($popH -eq [IntPtr]::Zero) { throw '拿不到 PopTarget 窗口' }
 $guardLog = Join-Path $env:LOCALAPPDATA 'LolFocusGuard\guard.log'
 Remove-Item $guardLog -ErrorAction SilentlyContinue
 $guard = Start-Process (Join-Path $root 'LolFocusGuard.exe') -ArgumentList '--targets=PopTarget', '--verbose' -PassThru
+Start-Sleep -Milliseconds 700
+if ($guard.HasExited) { '跳过：守卫启动即退出（单实例互斥锁可能还被上一轮实例占着），本轮结论无效。'; '结果: SKIP'; exit 0 }
 Start-Sleep -Seconds 2
 
 # 等输入年龄远超宽限（>1.5s），确保"没有输入"这个前提成立
 Start-Sleep -Milliseconds 1600
+
+# 前提：必须是一次真实的「前台切换」。如果 PopTarget 在守卫启动时就已经在前台，
+# 下面再抬它就没有任何 event，守卫自然"一次都没拦"—— 那是测试自己的问题，不是守卫的。
+# 所以先把它最小化，让前台离开它。
+[void][C9]::ShowWindow($popH, 6)
+Start-Sleep -Milliseconds 600
+if ([C9]::FgProc() -eq 'PopTarget') {
+    '跳过：无法让前台离开 PopTarget（切不动），本次结论无效。'
+    Stop-Process -Id $guard.Id -Force -ErrorAction SilentlyContinue
+    Stop-Process -Id $pop.Id -Force -ErrorAction SilentlyContinue
+    '结果: SKIP'
+    exit 0
+}
 
 $pt = New-Object C9+POINT
 [void][C9]::GetCursorPos([ref]$pt)

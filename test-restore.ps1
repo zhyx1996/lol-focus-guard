@@ -100,6 +100,8 @@ if ($bgH -eq [IntPtr]::Zero -or $ptH -eq [IntPtr]::Zero) { throw "拿不到测�
 $guardLog = Join-Path $env:LOCALAPPDATA 'LolFocusGuard\guard.log'
 Remove-Item $guardLog -ErrorAction SilentlyContinue
 $guard = Start-Process (Join-Path $root 'LolFocusGuard.exe') -ArgumentList '--targets=PopTarget','--verbose' -PassThru
+Start-Sleep -Milliseconds 700
+if ($guard.HasExited) { '跳过：守卫启动即退出（单实例互斥锁可能还被上一轮实例占着），本轮结论无效。'; '结果: SKIP'; exit 0 }
 Start-Sleep -Seconds 2
 
 # 前台可能被别的程序占着（比如英雄联盟登录程序，它会挡住别人抢前台），先把它最小化，

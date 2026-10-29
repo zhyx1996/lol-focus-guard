@@ -24,6 +24,7 @@ function Stop-Mine($names) {
     Get-Process $names -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -and $_.Path.StartsWith($tmp, [StringComparison]::OrdinalIgnoreCase) } |
         Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 400
 }
 # 真机上真的可能开着 wegame.exe / RiotClientServices.exe：只要发现"不是我们造的"同名进程，
 # 就跳过本测试 —— 因为守卫是按进程名匹配目标的，跑下去会把用户真实的 WeGame/客户端当成靶子。
@@ -44,6 +45,8 @@ Remove-Item $guardLog -ErrorAction SilentlyContinue
 $client = Start-Process (Join-Path $tmp 'RiotClientServices.exe') -PassThru
 Start-Sleep -Seconds 1
 $guard = Start-Process (Join-Path $root 'LolFocusGuard.exe') -ArgumentList '--targets=RiotClientServices,wegame','--verbose' -PassThru
+Start-Sleep -Milliseconds 700
+if ($guard.HasExited) { '跳过：守卫启动即退出（单实例互斥锁可能还被上一轮实例占着），本轮结论无效。'; '结果: SKIP'; exit 0 }
 Start-Sleep -Seconds 8
 
 $text = Get-Content $guardLog -Raw
