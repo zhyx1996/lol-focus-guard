@@ -56,6 +56,13 @@ namespace LolFocusGuard
         [DllImport("user32.dll")]
         public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 
+        // GW_ENABLEDPOPUP = 6：如果这个窗口上正挂着一个模态对话框，返回那个对话框；
+        // 没有就返回窗口自己。用来判断"打回它会不会让你错过必须点的弹窗"。
+        public const uint GW_ENABLEDPOPUP = 6;
+
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowEnabled(IntPtr hWnd);
+
         [DllImport("user32.dll")]
         public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
 
@@ -1838,6 +1845,29 @@ namespace LolFocusGuard
                     int number = ++_blockCount;
                     _lastBlockAt = Clock.NowMs();
                     _lastBlockedHwnd = hwnd;
+
+                    // 诊断（只 verbose）：这个窗口当时是不是"正在显示必须点的模态弹窗"。
+                    // 为什么要记：如果它弹的是"对局已就绪/接受对局"这种要你点一下的东西，
+                    // 我们把它打回等于让你错过对局。现在先只记录证据，不改判定 ——
+                    // 等真机日志里出现了，再决定要不要对这种情况特殊处理。
+                    if (_verbose)
+                    {
+                        try
+                        {
+                            // IsWindowEnabled=False = 这个窗口上有模态对话框（子窗口先接管输入）。
+                            // GW_ENABLEDPOPUP 再把那个模态子窗口指出来（没有就返回它自己）。
+                            if (!Native.IsWindowEnabled(hwnd))
+                            {
+                                IntPtr popup = Native.GetWindow(hwnd, Native.GW_ENABLEDPOPUP);
+                                Log(string.Format("诊断：这个窗口打回时不可交互（IsWindowEnabled=False，模态子窗口={0}）——" +
+                                    "可能正在显示必须点的弹窗，如果真机上因此漏掉对局，就靠这条日志定位",
+                                    popup == IntPtr.Zero ? "无" : popup.ToString()));
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
 
                     Log(string.Format("拦截 #{0}：{1} (pid={2}) 自己弹到前台（刚才最小化={3}{4}，class={5}，标题=\"{6}\"，尺寸={7}，事件延迟={8}ms）→ 打回",
                         number, proc, pid, wasMinimized ? "是" : "否",
