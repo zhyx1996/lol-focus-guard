@@ -35,6 +35,15 @@ namespace LolFocusGuard
         /// <summary>上一次按 Alt/Win 距今多少毫秒。</summary>
         public double ModifierIdleMs = double.MaxValue;
 
+        /// <summary>
+        /// Alt+Tab 切换器此刻还开着（EVENT_SYSTEM_SWITCHSTART 到了、SWITCHEND 还没到）。
+        /// 慢客户端从 Alt+Tab 到你松手之后才画出来，光靠"最近按过 Alt"（1.5 秒）不够。
+        /// </summary>
+        public bool Switching;
+
+        /// <summary>Alt+Tab 切换器关掉（SWITCHEND）距今多少毫秒。没关过就是 MaxValue。</summary>
+        public double SwitchEndedMs = double.MaxValue;
+
         /// <summary>最近一次「鼠标物理按键按下」距今多少毫秒。没按过就是 MaxValue。</summary>
         public double ClickAgeMs = double.MaxValue;
 
@@ -57,6 +66,7 @@ namespace LolFocusGuard
         AllowJustAllowed,
         AllowJustAllowedProc,
         AllowModifier,
+        AllowSwitching,
         AllowPrevWindowGone,
         AllowClickedTarget,
         AllowClickedShell,
@@ -81,6 +91,7 @@ namespace LolFocusGuard
     {
         public const int ModifierGraceMs = 1500;
         public const int ClickGraceMs = 350;   // 按键按下后多久内算"这次切换是你点的"
+        public const int SwitchEndGraceMs = 2500; // Alt+Tab 切换器关掉后多久内还算"你切的"
 
         /// <summary>
         /// 判定顺序就是优先级，改顺序 = 改行为，测试里有对应用例。
@@ -110,6 +121,13 @@ namespace LolFocusGuard
 
             // 4) 刚按过 Alt / Win（切窗口专用键）
             if (f.ModifierIdleMs <= ModifierGraceMs) return new Decision(true, DecisionCode.AllowModifier);
+
+            // 4.5) Alt+Tab 兜底：切换器还开着，或者刚松开（SWITCHEND 之后 2.5 秒内）。
+            //      慢客户端的问题是"你 Alt+Tab 过去，它 2 秒后才把窗口画出来"，
+            //      那时 1.5 秒的 Alt 宽限早就过了，会被判成自弹 → 误拦。
+            //      切换器开着/刚关掉是比"按过 Alt"更硬的证据，所以单独给一条，不改 ModifierGraceMs。
+            if (f.Switching || f.SwitchEndedMs <= SwitchEndGraceMs)
+                return new Decision(true, DecisionCode.AllowSwitching);
 
             // 5) 上一个前台窗口已经没了：前台自然接管，不算它抢
             if (f.PrevWindowGone) return new Decision(true, DecisionCode.AllowPrevWindowGone);

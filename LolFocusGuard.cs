@@ -126,6 +126,10 @@ namespace LolFocusGuard
         public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
         public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+        // Alt+Tab 切换器：START(0x0014) 在你按下 Alt+Tab 打开切换器时来，END(0x0015) 在你松手时来。
+        // 注意别和 EVENT_SYSTEM_DIALOGSTART/END（0x0010/0x0011）搞混，那是对话框。
+        public const uint EVENT_SYSTEM_SWITCHSTART = 0x0014;
+        public const uint EVENT_SYSTEM_SWITCHEND = 0x0015;
         public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
         public const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
         public const int SW_MINIMIZE = 6;
@@ -295,13 +299,22 @@ namespace LolFocusGuard
         private readonly Dictionary<IntPtr, DateTime> _suppressedUntil = new Dictionary<IntPtr, DateTime>();
         // Alt / Win 最后一次按下的时间：这两个键才是"切窗口"用的
         private DateTime _lastModifierAt = DateTime.MinValue;
+        // Alt+Tab 切换器状态（EVENT_SYSTEM_SWITCHSTART / SWITCHEND）：慢客户端兜底
+        private IntPtr _switchHook = IntPtr.Zero;
+        private volatile bool _altTabOpen;
+        private DateTime _lastSwitchStartAt = DateTime.MinValue;
+        private DateTime _lastSwitchEndAt = DateTime.MinValue;
+        private int _switchCount;
+        // 切换器"开着"最多认多久：SWITCHEND 丢掉时不能让守卫永久放行（见 PollOnce 里的自愈）
+        private const int SWITCH_MAX_OPEN_MS = 10000;
         private DateTime _lastClickAt = DateTime.MinValue;
         private string _lastClickWhere = "";
         // 按下那一刻指针命中的窗口类名：用来把"点任务栏"和"点资源管理器文件夹窗口"分开
         // （两者同属 explorer.exe，只看进程名分不出来）
         private string _lastClickClass = "";
         private bool _mouseWasDown;
-        private int _clickCount;
+        private int _clickCount;      // 15ms 采样线程抓到的按下次数（钩子被 ACE 掐掉时只剩这个）
+        private int _hookClickCount;  // 钩子回调抓到的按下次数（快点击不漏采）；一直不涨 = 钩子被掐了
         private const int MODIFIER_GRACE_MS = FocusRules.ModifierGraceMs;
         private const int JUST_ALLOWED_MS = 3000; // 刚放行过的**同一个窗口**，这段时间内不再压回去（你还在用它）
         // 同一个程序**别的窗口**只给 600ms：原来这一档也是 3 秒，等于"你在客户端里点过任何一处，
@@ -326,6 +339,12 @@ namespace LolFocusGuard
             _callback = new Native.WinEventDelegate(OnForegroundChanged);
             _hook = Native.SetWinEventHook(
                 Native.EVENT_SYSTEM_FOREGROUND, Native.EVENT_SYSTEM_FOREGROUND,
+                IntPtr.Zero, _callback, 0, 0,
+                Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS);
+            // 同一个回调再挂一个 hook 管 Alt+Tab 切换器的开/关（EVENT_SYSTEM_SWITCHSTART/END）。
+            // 用一个事件范围而不是一个值：0x0014~0x0015。
+            _switchHook = Native.SetWinEventHook(
+                Native.EVENT_SYSTEM_SWITCHSTART, Native.EVENT_SYSTEM_SWITCHEND,
                 IntPtr.Zero, _callback, 0, 0,
                 Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS);
 
@@ -373,14 +392,19 @@ namespace LolFocusGuard
 
             Log("守卫启动，监控进程: " + string.Join(", ", _targets));
             if (_hook == IntPtr.Zero) Log("警告：SetWinEventHook 失败，无法监听前台切换");
+            if (_switchHook == IntPtr.Zero)
+                Log("警告：Alt+Tab 切换器事件钩子没装上，只能靠「1.5 秒内按过 Alt」兜底（慢客户端可能被误拦）");
             if (_mouseHook == IntPtr.Zero || _kbdHook == IntPtr.Zero)
             {
-                Log("警告：低级输入钩子安装失败，只能按「没输入就拦」的保守规则工作");
+                Log("警告：低级输入钩子安装失败，点击证据只能靠 15ms 采样（极快单击可能漏采），其余判定不受影响");
             }
             else
             {
-                Log(string.Format("判定依据: 鼠标按键（{0}ms 内按下过就算你切的）+ 按下那一刻的指针位置；硬件状态读得到，ACE 掐不掉；低级钩子{1}",
-                    CLICK_GRACE_MS, (_mouseHook != IntPtr.Zero && _kbdHook != IntPtr.Zero) ? "已安装（可能被 WeGame 的 ACE 掐掉，不影响判定）" : "没装上（不影响判定）"));
+                Log(string.Format("判定依据: 鼠标按键（{0}ms 内按下过就算你切的）+ 按下那一刻的指针位置；"
+                    + "钩子{1}，采样线程每 15ms 兜底；Alt+Tab 切换器事件{2}",
+                    CLICK_GRACE_MS,
+                    _mouseHook != IntPtr.Zero ? "已安装（可能被 WeGame 的 ACE 掐掉，不影响判定）" : "没装上（不影响判定）",
+                    _switchHook != IntPtr.Zero ? "已挂上" : "没挂上"));
             }
         }
 
@@ -422,6 +446,15 @@ namespace LolFocusGuard
                 if (_paused && _resumeAt != DateTime.MinValue && DateTime.Now >= _resumeAt)
                 {
                     Resume();
+                }
+
+                // Alt+Tab 切换器"开着"不能是无期限的：SWITCHEND 有可能收不到（切换器被别的程序关掉、
+                // 钩子错过事件、以鼠标点选结束切换），一旦 _altTabOpen 卡在 true，就等于**永久放行一切**，
+                // 守卫彻底失效。所以按"开着最多认 10 秒"自己兜底复位（正常 Alt+Tab 也就 1~2 秒）。
+                if (_altTabOpen && (DateTime.Now - _lastSwitchStartAt).TotalMilliseconds > SWITCH_MAX_OPEN_MS)
+                {
+                    _altTabOpen = false;
+                    Log("提示：Alt+Tab 切换器状态超时自动复位（没收到 SWITCHEND，最多认 " + SWITCH_MAX_OPEN_MS + "ms）");
                 }
 
                 // 目标窗口列表每秒刷新一次（进程重启、新窗口、pid 变化都能跟得上）
@@ -498,9 +531,12 @@ namespace LolFocusGuard
 
                 if (_verbose && (_pollTicks++ % 20) == 0)
                 {
-                    Log(string.Format("心跳 fg={0} 按键={1} 钩子输入={2}次 钩子最后输入={3}ms前({4})",
+                    Log(string.Format("心跳 fg={0} 按键={1} 点击采样={2}/钩子={3} 切换器事件={4}次 钩子输入={5}次 最后输入={6}ms前({7})",
                         ProcNameOf(fg),
                         _lastClickAt == DateTime.MinValue ? "没按过或已用掉" : string.Format("{0:0}ms前@{1}", (DateTime.Now - _lastClickAt).TotalMilliseconds, _lastClickWhere.Length > 0 ? _lastClickWhere : "?"),
+                        _clickCount,
+                        _hookClickCount,
+                        _switchCount,
                         _inputCount,
                         _inputAgeMs,
                         _lastInputWhere.Length > 0 ? _lastInputWhere : "-"));
@@ -621,9 +657,19 @@ namespace LolFocusGuard
             }
         }
         /// <summary>鼠标指针下面那个顶层窗口属于哪个进程。</summary>
-        private static string ProcUnderCursor()        {
+        private static string ProcUnderCursor()
+        {
             Native.POINT pt;
             if (!Native.GetCursorPos(out pt)) return string.Empty;
+            return ProcUnderPoint(pt);
+        }
+
+        /// <summary>
+        /// 指定屏幕坐标下面那个顶层窗口属于哪个进程。
+        /// 钩子回调里用 MSLLHOOKSTRUCT.pt 调这里，采样线程用 GetCursorPos 调这里，两条路同一套算法。
+        /// </summary>
+        private static string ProcUnderPoint(Native.POINT pt)
+        {
             IntPtr under = Native.WindowFromPoint(pt);
             if (under == IntPtr.Zero) return string.Empty;
             IntPtr root = Native.GetAncestor(under, Native.GA_ROOT);
@@ -635,10 +681,10 @@ namespace LolFocusGuard
         /// <summary>
         /// Windows 的"点击入口"窗口类。点这些地方都属于"你自己在切窗口/唤起程序"，
         /// 不能判成"按在别处"。分两类：
-        ///   · 任务栏本身（Shell_TrayWnd / Shell_SecondaryTrayWnd）→ 享受 2.5 秒长宽限
+        ///   · 任务栏（Shell_TrayWnd / Shell_SecondaryTrayWnd）和任务栏缩略图预览 → 享受 2.5 秒长宽限
         ///     （从按下到窗口真正激活可能要几百毫秒，客户端从最小化恢复尤其慢）；
-        ///   · 其它入口（托盘溢出面板、开始菜单、任务视图、任务栏缩略图预览）→ 本身是顶层窗口，
-        ///     激活很快，只按常规 350ms 算。
+        ///   · 其它入口（托盘溢出面板、开始菜单、任务视图）→ 本身是顶层窗口，激活很快，
+        ///     只按常规 350ms 算。
         /// 注意：资源管理器的**文件夹窗口**（CabinetWClass）不在这个名单里 ——
         /// 它同属 explorer.exe，但点它并不意味着你要切到客户端，否则客户端自弹会搭这趟顺风车。
         /// </summary>
@@ -654,18 +700,26 @@ namespace LolFocusGuard
             "XamlExplorerHostIslandWindow"         // 任务视图 / 虚拟桌面（Win11）
         };
 
+        /// <summary>鼠标指针下面那个窗口的类名（采样线程兜底用；算法见 ClassUnderPoint）。</summary>
+        private static string ClassUnderCursor()
+        {
+            Native.POINT pt;
+            if (!Native.GetCursorPos(out pt)) return string.Empty;
+            return ClassUnderPoint(pt);
+        }
+
         /// <summary>
-        /// 鼠标指针下面那个窗口的类名（用来区分「任务栏/托盘/开始菜单」和「资源管理器文件夹窗口」）。
+        /// 指定屏幕坐标下面那个窗口的类名（用来区分「任务栏/托盘/开始菜单」和「资源管理器文件夹窗口」）。
         ///
         /// WindowFromPoint 命中的往往是容器里的子窗口（Start / TrayNotifyWnd / MSTaskSwWClass…），
         /// 所以必须沿 GetParent 逐级向上找。**不能用 GetAncestor(GA_ROOT)**：它一步就到顶层，
         /// 循环等于没转；而且托盘溢出面板、开始菜单、任务视图这些入口**本身就是顶层窗口**，
         /// 类名不在任务栏那一层，用 GA_ROOT 会把它们全当成"按在别处"→ 把用户要打开的窗口最小化。
+        ///
+        /// 钩子回调（MSLLHOOKSTRUCT.pt）和采样线程（GetCursorPos）都调这里，两条路语义一致。
         /// </summary>
-        private static string ClassUnderCursor()
+        private static string ClassUnderPoint(Native.POINT pt)
         {
-            Native.POINT pt;
-            if (!Native.GetCursorPos(out pt)) return string.Empty;
             IntPtr h = Native.WindowFromPoint(pt);
             if (h == IntPtr.Zero) return string.Empty;
 
@@ -1011,6 +1065,24 @@ namespace LolFocusGuard
         private void OnForegroundChanged(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
             int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
         {
+            // Alt+Tab 切换器的开/关事件也走这个回调（挂了第二个 hook）。
+            // 这里只记两个字段就返回，不做任何窗口/进程查询 —— 回调跑在我们的消息循环线程上，
+            // 拖慢它会连带拖慢后面的前台事件。
+            if (eventType == Native.EVENT_SYSTEM_SWITCHSTART)
+            {
+                _altTabOpen = true;
+                _lastSwitchStartAt = DateTime.Now;
+                _switchCount++;
+                return;
+            }
+            if (eventType == Native.EVENT_SYSTEM_SWITCHEND)
+            {
+                _altTabOpen = false;
+                _lastSwitchEndAt = DateTime.Now;
+                _switchCount++;
+                return;
+            }
+
             // dwmsEventTime 是事件发生时的系统 tick，能算出"系统通知到我"的延迟
             try
             {
@@ -1195,6 +1267,10 @@ namespace LolFocusGuard
                 facts.SameWindowJustAllowed = sameHwnd && allowAgeMs < JUST_ALLOWED_MS;
                 facts.SameProcJustAllowed = sameProc && allowAgeMs < JUST_ALLOWED_PROC_MS;
                 facts.ModifierIdleMs = (DateTime.Now - _lastModifierAt).TotalMilliseconds;
+                // Alt+Tab 兜底：切换器开着，或者刚松开（SWITCHEND 之后 2.5 秒内）。
+                // 慢客户端"Alt+Tab 过去 2 秒后才画出来"就靠这条救，1.5 秒的 Alt 宽限不够。
+                facts.Switching = _altTabOpen;
+                facts.SwitchEndedMs = (DateTime.Now - _lastSwitchEndAt).TotalMilliseconds;
                 // 「你手动切窗口」的硬证据：鼠标物理按键真的按下了（ClickWatchLoop 每 15ms 采一次），
                 // 以及按下那一刻指针落在谁身上。它自己抢前台的时候一个按键都没有，这条能把两者分开。
                 // 记下本次判定用的那一份点击证据（下面"用完即弃"要确认消费的还是同一份，
@@ -1233,6 +1309,7 @@ namespace LolFocusGuard
                         decision.Code == DecisionCode.AllowClickedTarget ||
                         decision.Code == DecisionCode.AllowClickedShell ||
                         decision.Code == DecisionCode.AllowModifier ||
+                        decision.Code == DecisionCode.AllowSwitching ||
                         decision.Code == DecisionCode.AllowFirstClientWindow ||
                         decision.Code == DecisionCode.AllowWeGameLogin;
 
@@ -1314,6 +1391,15 @@ namespace LolFocusGuard
                     break;
                 case DecisionCode.AllowModifier:
                     if (_verbose) Log("放行原因: Alt/Win 切换");
+                    break;
+                case DecisionCode.AllowSwitching:
+                    if (_verbose)
+                    {
+                        Log(_altTabOpen
+                            ? "放行原因: Alt+Tab 切换器还开着（还没松手，是你在切）"
+                            : string.Format("放行原因: 刚用 Alt+Tab 切完窗口（切换器关掉 {0:0}ms，{1}ms 内都算你切的）",
+                                (DateTime.Now - _lastSwitchEndAt).TotalMilliseconds, FocusRules.SwitchEndGraceMs));
+                    }
                     break;
                 case DecisionCode.AllowPrevWindowGone:
                     if (_verbose) Log("放行原因: 上一个前台窗口已经关闭，前台自动接管");
@@ -1408,17 +1494,33 @@ namespace LolFocusGuard
             if (nCode >= 0)
             {
                 int msg = wParam.ToInt32();
-                if (msg == Native.WM_LBUTTONDOWN || msg == Native.WM_RBUTTONDOWN ||
-                    msg == Native.WM_MBUTTONDOWN || msg == Native.WM_XBUTTONDOWN ||
-                    msg == Native.WM_MOUSEWHEEL)
+                bool isButtonDown = msg == Native.WM_LBUTTONDOWN || msg == Native.WM_RBUTTONDOWN ||
+                                    msg == Native.WM_MBUTTONDOWN || msg == Native.WM_XBUTTONDOWN;
+                if (isButtonDown || msg == Native.WM_MOUSEWHEEL)
                 {
+                    // 回调跑在输入线程上：这里只做 WindowFromPoint + 类名/进程名查询，
+                    // 不写日志、不加锁、不分配大对象、不碰事件队列 —— 拖慢它等于拖慢整机输入。
                     try
                     {
                         Native.MSLLHOOKSTRUCT info = (Native.MSLLHOOKSTRUCT)
                             Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
-                        IntPtr under = Native.WindowFromPoint(info.pt);
-                        IntPtr root = Native.GetAncestor(under, Native.GA_ROOT);
-                        _lastInputWhere = ProcNameOf(root == IntPtr.Zero ? under : root);
+                        // 注意：MSLLHOOKSTRUCT.pt 是**屏幕像素坐标**，和我们进程（已 SetProcessDPIAware）
+                        // 里 GetCursorPos 拿到的坐标系一致，所以可以直接喂给 WindowFromPoint。
+                        string proc = ProcUnderPoint(info.pt);
+                        _lastInputWhere = proc;
+                        if (isButtonDown && msg != Native.WM_XBUTTONDOWN)
+                        {
+                            // 左/右/中键都算"点了一下"。侧键（XBUTTON）不切窗口，只记输入；
+                            // 而且它和左键常常成对按下，记进来会让"你点了它"变成误判。
+                            // 和 15ms 采样线程写同一组字段、同一个顺序（时间戳最后写，
+                            // 当作"这一份证据生效"的提交点）。两路并行最多是重复采到同一次按下，
+                            // 谁后写谁覆盖，字段之间不会错配。
+                            string cls = ClassUnderPoint(info.pt);
+                            _lastClickWhere = proc;
+                            _lastClickClass = cls;
+                            _lastClickAt = DateTime.Now;
+                            _hookClickCount++;
+                        }
                     }
                     catch
                     {
@@ -1791,6 +1893,11 @@ namespace LolFocusGuard
             {
                 Native.UnhookWinEvent(_hook);
                 _hook = IntPtr.Zero;
+            }
+            if (_switchHook != IntPtr.Zero)
+            {
+                Native.UnhookWinEvent(_switchHook);
+                _switchHook = IntPtr.Zero;
             }
             if (_mouseHook != IntPtr.Zero)
             {

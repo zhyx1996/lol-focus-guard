@@ -100,6 +100,29 @@ internal static class LogicTest
         f.ModifierIdleMs = 1501;
         Case("Alt/Win 过了 1501ms → 不算数", f, false, DecisionCode.BlockNoClick);
 
+        // ---- 放行：Alt+Tab 切换器（慢客户端兜底）----
+        f = Idle();
+        f.Switching = true;
+        Case("Alt+Tab 切换器还开着（还没松手）→ 放行", f, true, DecisionCode.AllowSwitching);
+
+        f = Idle();
+        f.SwitchEndedMs = 2000;
+        Case("Alt+Tab 刚刚切完（切换器关掉 2000ms）→ 放行", f, true, DecisionCode.AllowSwitching);
+
+        f = Idle();
+        f.SwitchEndedMs = 2500;
+        Case("Alt+Tab 切换器关掉正好 2500ms → 放行（边界）", f, true, DecisionCode.AllowSwitching);
+
+        f = Idle();
+        f.SwitchEndedMs = 3000;   // 你写的用例：SWITCHEND 3 秒后不再放行
+        Case("Alt+Tab 切换器关掉 3000ms 后 → 不再算你切的，没按键就拦", f, false, DecisionCode.BlockNoClick);
+
+        f = Idle();
+        f.Switching = true;
+        f.ClickAgeMs = 100;
+        f.ClickOnTarget = false;
+        Case("Alt+Tab 切换器开着优先于「按在别处」→ 仍放行", f, true, DecisionCode.AllowSwitching);
+
         f = Idle();
         f.PrevWindowGone = true;
         Case("上一个前台窗口已关闭（刚打完这局）→ 放行", f, true, DecisionCode.AllowPrevWindowGone);
