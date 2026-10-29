@@ -646,12 +646,15 @@ namespace LolFocusGuard
                     bool targetWindow = clickRecent && _targets.Contains(_lastClickWhere);
                     bool winPressed = modifierAge < blockAge && _lastModifierWasWin;
                     bool userTakingOver = FocusRules.IsSwitchGesture(shellEntry, targetWindow, winPressed);
-                    // 重试间隔压到 120ms 之后必须多这一道保险：你要是**在这 120ms 之前**就点了
-                    // 任务栏/客户端窗口（点击早于拦截，所以上面那条 clickRecent 不算），
-                    // 说明这一次是你在切它 —— 那就别再压，否则又变成"我点出来了它又被缩掉"。
-                    bool anyRecentSwitchClick = clickAge <= SHELL_CLICK_GRACE_MS &&
-                                                (shellEntry || (clickAge <= CLICK_GRACE_MS && targetWindow));
-                    if (anyRecentSwitchClick) userTakingOver = true;
+                    // 重试间隔压到 120ms 之后必须多这一道保险：你要是**在拦截之前**就点了任务栏
+                    // 或客户端窗口（点击早于拦截，所以上面 clickRecent 那两行不算），说明这次是你
+                    // 在切它 —— 那就别再压，否则又变成"我点出来了它又被缩掉"。
+                    // 注意这里要**重新算**，不能复用 shellEntry/targetWindow：那两个变量带着
+                    // "点击必须晚于拦截"的条件，正好把要防的那种情况排除掉了。
+                    bool shellClickAnyTime = clickAge <= SHELL_CLICK_GRACE_MS &&
+                                             IsShellProcess(_lastClickWhere) && IsShellClickClass(_lastClickClass);
+                    bool targetClickAnyTime = clickAge <= CLICK_GRACE_MS && _targets.Contains(_lastClickWhere);
+                    if (shellClickAnyTime || targetClickAnyTime) userTakingOver = true;
 
                     if (_paused || Clock.AgeMs(_lastAllowAt) < blockAge || userTakingOver)
                     {
