@@ -32,10 +32,15 @@ if ($LASTEXITCODE -ne 0) { throw "编译 LolFocusGuard 失败: $LASTEXITCODE" }
     FakeClient.cs
 if ($LASTEXITCODE -ne 0) { throw "编译 FakeClient 失败: $LASTEXITCODE" }
 
+& $csc /nologo /target:winexe /optimize+ /out:FakeGame.exe `
+    /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
+    FakeGame.cs
+if ($LASTEXITCODE -ne 0) { throw "编译 FakeGame 失败: $LASTEXITCODE" }
+
 # 规则表测试（控制台程序，不开窗口、不注入输入）
 & $csc /nologo /target:exe /optimize+ /out:LogicTest.exe `
     /r:System.dll /r:System.Core.dll `
     LogicTest.cs Rules.cs
 if ($LASTEXITCODE -ne 0) { throw "编译 LogicTest 失败: $LASTEXITCODE" }
 
-Write-Host '编译完成: LolFocusGuard.exe, FakeClient.exe, LogicTest.exe'
+Write-Host '编译完成: LolFocusGuard.exe, FakeClient.exe, FakeGame.exe, LogicTest.exe'
