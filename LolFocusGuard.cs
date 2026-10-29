@@ -594,9 +594,14 @@ namespace LolFocusGuard
                 // 这是不依赖任何钩子的系统级事实，安全软件（WeGame 的 ACE / SGuard）拦不住。
                 UpdateInputState();
 
-                // 每 4 个 tick 扫一遍目标进程的窗口，记下谁现在是最小化的
-                if ((_scanTick++ % 4) == 0) ScanIconic();
-                if ((_scanTick % 20) == 0) RefreshClientRunning();
+                // 扫目标进程的窗口，记下谁现在是最小化的。
+                // 原来每 4 个 tick（200ms）一次，是整个循环里最贵的一步（EnumWindows 要把
+                // 桌面上的窗口全过一遍、每个都进一次托管回调）。改成 8 个 tick（400ms）：
+                // 要判的是"弹出之前是不是最小化的"，真实场景里最小化状态至少保持几百毫秒
+                // （IsRecentlyIconic 的窗口是 5 秒），400ms 采样足够。
+                if ((_scanTick++ % 8) == 0) ScanIconic();
+                // 进程是否在跑：枚举进程 1 秒一次没必要，2 秒足够（客户端起退的判定宽限是秒级）
+                if ((_scanTick % 40) == 0) RefreshClientRunning();
                 // 每 30 分钟留一行"我还活着"：长局/挂机几小时后，日志里能证明守卫一直在跑，
                 // 而不是半路退出（不然"没拦"到底是不该拦还是根本没在跑就分不清了）。
                 if (Clock.AgeMs(_lastAliveLogAt) > 30 * 60 * 1000)
@@ -610,7 +615,7 @@ namespace LolFocusGuard
                 {
                     try
                     {
-                        RefreshLoginState(); // 约每 2 秒查一次登录状态
+                        RefreshLoginState(); // 约每 2 秒查一次登录状态（文件很小，不用省）
                     }
                     catch (Exception ex)
                     {
