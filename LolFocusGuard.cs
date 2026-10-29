@@ -252,6 +252,15 @@ namespace LolFocusGuard
         private int _pollTicks;
         private long _lastBlockAt = Clock.Never;
         private IntPtr _lastBlockedHwnd = IntPtr.Zero;
+        // 拦截请求序号 + 该请求针对的窗口：排队的最小化动作在真正动手前要确认自己没被更新的请求取代
+        // （同一个窗口连着两次请求时只执行最后一次，免得同一窗口被压两遍）。
+        // 只在 Block()（回调线程）里 Interlocked 递增，动作线程只读；读到的值略旧也无非是多执行一次，不影响安全。
+        private int _blockRequestSeq;
+        private IntPtr _blockRequestHwnd = IntPtr.Zero;
+        // 一个鼠标/Alt 证据都没有的那一轮（BlockNoClick），动作线程先等这么久再复查一次：
+        // 前台事件走 WinEvent 钩子、点击证据走低级鼠标钩子或 15ms 采样线程，
+        // "点击 → 窗口被激活"这条链上前台事件可能比点击证据先到。
+        private const int LATE_EVIDENCE_WAIT_MS = 30;
 
         // pid → 进程名缓存（热路径里不能每 50ms 都去 new Process，那是几十毫秒的开销）
         private readonly Dictionary<int, string> _pidNames = new Dictionary<int, string>();
@@ -1374,7 +1383,8 @@ namespace LolFocusGuard
 
                 _pendingBlockHwnd = hwnd;
                 _pendingBlockAt = Clock.NowMs();
-                Block(hwnd);
+                // 只有"什么证据都没有"的那一轮才值得等 30ms 复查（有证据的轮次多等也是白等）
+                Block(hwnd, decision.Code == DecisionCode.BlockNoClick);
             }
         }
 
@@ -1633,24 +1643,26 @@ namespace LolFocusGuard
         /// 打回动作：先最小化（从后台弹出来的情况），再把前台交还给原来的窗口。
         /// 放到后台线程执行，避免任何一次系统调用卡住钩子线程/轮询线程。
         /// </summary>
-        private void Block(IntPtr hwnd)
+        /// <param name="waitForLateEvidence">
+        /// true = 本轮判定码是 BlockNoClick（一个鼠标/Alt 证据都没有）。这种轮次的"成因点击"
+        /// 可能只是还没被钩子/15ms 采样线程记下来，所以动作线程先等 LATE_EVIDENCE_WAIT_MS 再复查。
+        /// </param>
+        private void Block(IntPtr hwnd, bool waitForLateEvidence)
         {
             long now = Clock.NowMs();
             if (Clock.AgeMs(_lastBlockRequestAt) < 80) return; // 防重入抖动
             _lastBlockRequestAt = now;
-            // 先取旧值再更新：escalating 要算的正是"上一次拦截到现在隔了多久"。
+            // 先取旧值：escalating 要算的正是"上一次拦截到现在隔了多久"。
             // 之前是先 _lastBlockAt = now 再取，差值恒为 0，于是任何窗口被拦过第二次就永远
             // 被当成"连续弹"（而且 _lastBlockedHwnd 永不复位），一直走最强硬的最小化路径。
             long previousBlockAt = _lastBlockAt;
-            _lastBlockAt = now;
-
-            int number = ++_blockCount;
 
             // 同一窗口在 2 秒内又来抢前台 → 说明只把焦点还回去不够（它自己还会再弹），
             // 直接最小化掉，别跟它来回拉锯。
+            // 注意：这里只做"快照判断"，_lastBlockAt / _lastBlockedHwnd 的更新挪到动作真的执行时
+            // （否则一次被取消的拦截也会算成"刚拦过"，让下一次无端升级成最小化）。
             bool escalating = (hwnd == _lastBlockedHwnd) &&
                               Clock.AgeMs(previousBlockAt) < 2000;
-            _lastBlockedHwnd = hwnd;
 
             bool wasMinimized = escalating || IsRecentlyIconic(hwnd, 5) ||
                                 (_targetHwnd == hwnd && _targetWasMinimized);
@@ -1664,6 +1676,9 @@ namespace LolFocusGuard
                 restore = IntPtr.Zero;
             }
 
+            // 日志用的快照。注意 "拦截 #N" 这行日志挪到了动作线程里、复核通过之后才写：
+            // 否则"先记了拦截、又取消了"会让日志里的拦截次数、托盘计数和测试脚本的统计全都偏大
+            // （test-user-intent 断言"保护期内 0 次拦截"、test-fake-client 数拦截次数，都吃这个）。
             string proc = ProcNameOfCached(hwnd);
             int pid = ProcIdOf(hwnd);
             string cls = ClassNameOf(hwnd);
@@ -1674,15 +1689,52 @@ namespace LolFocusGuard
                 : "?";
             int latency = _lastEventLatencyMs;
 
-            Log(string.Format("拦截 #{0}：{1} (pid={2}) 自己弹到前台（刚才最小化={3}{4}，class={5}，标题=\"{6}\"，尺寸={7}，事件延迟={8}ms）→ 打回",
-                number, proc, pid, wasMinimized ? "是" : "否",
-                escalating ? "，连续弹" : "", cls, title, size,
-                latency >= 0 ? latency.ToString() : "?"));
+            // 这个请求的"身份证"：动作排队之后可能被更新的请求取代，也可能你已经接管了
+            int requestId = System.Threading.Interlocked.Increment(ref _blockRequestSeq);
+            _blockRequestHwnd = hwnd;
+            long requestAt = now;
 
             QueueAction(delegate
             {
                 try
                 {
+                    // ---------- P0-B：没有点击证据的那一轮，先等 30ms 再看一眼 ----------
+                    // 只在动作线程里等：Block() 本身跑在前台事件回调线程上，在那里 sleep 会拖慢
+                    // 后面所有前台事件。有证据的轮次完全不进这里（多等 30ms 也是白等）。
+                    if (waitForLateEvidence)
+                    {
+                        System.Threading.Thread.Sleep(LATE_EVIDENCE_WAIT_MS);
+                        double lateClickAge = Clock.AgeMs(_lastClickAt);
+                        double lateModifierAge = Clock.AgeMs(_lastModifierAt);
+                        // BlockNoClick 的前提就是"判定那一刻点击已经 > 350ms、Alt 已经 > 1500ms"，
+                        // 所以这两个值在等完之后仍落在宽限内，只可能是这 30ms 里新到的证据。
+                        if (lateClickAge <= FocusRules.ClickGraceMs ||
+                            lateModifierAge <= FocusRules.ModifierGraceMs)
+                        {
+                            CancelBlocked(requestId, hwnd,
+                                string.Format("点击证据晚到（等 {0}ms 后按键={1}，Alt={2}）→ 放弃这次拦截",
+                                    LATE_EVIDENCE_WAIT_MS, DescribeAge(lateClickAge), DescribeAge(lateModifierAge)));
+                            return;
+                        }
+                    }
+
+                    // ---------- P0-A：排队这段时间世界可能已经变了，动手前再复核一次 ----------
+                    string why;
+                    if (!ShouldStillBlock(hwnd, requestId, requestAt, out why))
+                    {
+                        CancelBlocked(requestId, hwnd, why);
+                        return;
+                    }
+
+                    int number = ++_blockCount;
+                    _lastBlockAt = Clock.NowMs();
+                    _lastBlockedHwnd = hwnd;
+
+                    Log(string.Format("拦截 #{0}：{1} (pid={2}) 自己弹到前台（刚才最小化={3}{4}，class={5}，标题=\"{6}\"，尺寸={7}，事件延迟={8}ms）→ 打回",
+                        number, proc, pid, wasMinimized ? "是" : "否",
+                        escalating ? "，连续弹" : "", cls, title, size,
+                        latency >= 0 ? latency.ToString() : "?"));
+
                     // 没有可以交还的窗口时（比如上一个前台窗口本身也在监控名单里），
                     // 光"不还焦点"等于什么都没做，那就直接把它最小化掉，让系统自己挑下一个窗口。
                     if (wasMinimized || restore == IntPtr.Zero)
@@ -1737,6 +1789,92 @@ namespace LolFocusGuard
                     Log("拦截失败: " + ex.Message);
                 }
             });
+        }
+
+        /// <summary>
+        /// 排队的最小化动作"临动手前"的复核：还该不该拦。
+        ///
+        /// 为什么必须有这一步：Block() 在前台事件回调线程上跑，真正的最小化却排在专用动作线程上；
+        /// 动作线程可能正被上一个 job 占着（每个 job 里有 5/15/10ms 的 sleep），排队几十毫秒很正常。
+        /// 这几十毫秒里你按了任务栏 / 按了 Alt+Tab 打算自己接管，_pendingBlockHwnd 只会取消
+        /// "后续重试"，**已经排队的这一个动作照样会执行** —— 真机表现就是"我明明点出来了，
+        /// 又被压回去一下，得点好几遍"。所以每条判据都在执行前重新取一次，不再用入队时的快照。
+        /// </summary>
+        private bool ShouldStillBlock(IntPtr hwnd, int requestId, long requestAt, out string why)
+        {
+            why = null;
+            if (_disposed) { why = "守卫正在退出"; return false; }
+            if (_paused) { why = "你已经暂停了守卫"; return false; }
+            if (!Native.IsWindow(hwnd)) { why = "窗口已经不存在了"; return false; }
+
+            // 它已经不是前台了 → 没必要再压（很可能已经被别的路径/系统自己换掉了）
+            IntPtr fgNow = Native.GetForegroundWindow();
+            if (fgNow != hwnd)
+            {
+                why = string.Format("它已经不是前台窗口了（现在是 {0}）",
+                    fgNow == IntPtr.Zero ? "无" : ProcNameOfCached(fgNow));
+                return false;
+            }
+
+            // "入队之后你又按过鼠标 / Alt" = 这中间你已经接管了。
+            // AgeMs 越小越新，所以"比这次请求更晚" = AgeMs(证据) < AgeMs(请求时刻)。
+            double reqAge = Clock.AgeMs(requestAt);
+            double clickAge = Clock.AgeMs(_lastClickAt);
+            if (clickAge < reqAge)
+            {
+                why = string.Format("排队之后你按了鼠标（{0:0}ms前@{1}）",
+                    clickAge, _lastClickWhere.Length > 0 ? _lastClickWhere : "?");
+                return false;
+            }
+            double modifierAge = Clock.AgeMs(_lastModifierAt);
+            if (modifierAge < reqAge)
+            {
+                why = string.Format("排队之后你按了 Alt/Win（{0:0}ms前）", modifierAge);
+                return false;
+            }
+
+            // 同一个窗口已经有更新的请求排在后面了：让它去执行（它拿的是更新的 restore/escalating
+            // 快照），这一个作废，免得同一个窗口被连着压两次。
+            // 只按"同一个窗口"取代：两个不同窗口先后弹（A 然后 B）时，A 的那一次照样该压回去，
+            // 否则 A 就永远留在了前台。
+            if (requestId != _blockRequestSeq && hwnd == _blockRequestHwnd)
+            {
+                why = "已经被更新的拦截请求取代";
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 把"距今多少毫秒"写成日志友好的样子：从没发生过（AgeMs 返回 double.MaxValue）
+        /// 时不能直接 {0:0} —— 会打出 1797693134862320000… 这种一串天文数字。
+        /// </summary>
+        private static string DescribeAge(double ageMs)
+        {
+            if (ageMs >= double.MaxValue / 2) return "从没发生过";
+            return string.Format("{0:0}ms前", ageMs);
+        }
+
+        /// <summary>
+        /// 排队的最小化动作被取消。只在详细日志里留痕（普通日志只该出现真的拦下来的那些，
+        /// 否则用户/脚本数"拦截次数"会偏大），并连带取消它的"待重试"。
+        /// </summary>
+        private void CancelBlocked(int requestId, IntPtr hwnd, string why)
+        {
+            if (_verbose)
+            {
+                // 注意用词：这里不能写成 "拦截 #N：进程名" 的形式 —— 测试脚本是按
+                // /拦截 #\d+：进程名/ 数拦截次数的，取消不算拦下来的一次。
+                Log(string.Format("取消拦截（请求 #{0}）：{1} (pid={2}) —— {3}，这次不压回去",
+                    requestId, ProcNameOfCached(hwnd), ProcIdOf(hwnd), why));
+            }
+            // 连"待重试"一起取消：否则 400ms 后同一条待办还会再拦一次，你按的那一下等于白按
+            // （这正是"点了任务栏把它叫出来，1.2 秒后又被压回去"的另一个来源）。
+            // 只有最新那个请求有权清：更新的请求已经把待办换成它自己的了，别替它清掉。
+            if (requestId == _blockRequestSeq && _pendingBlockHwnd == hwnd)
+            {
+                _pendingBlockHwnd = IntPtr.Zero;
+            }
         }
 
         /// <summary>

@@ -86,6 +86,8 @@ if ($guard.HasExited) { '跳过：守卫启动即退出（单实例互斥锁可�
 
 # 输入注入可能被安全软件（WeGame 的 ACE）拦掉：SetCursorPos 返回 False 且指针不动。
 # 这时 A 阶段没法测，直接说明并跳过，不要误报 FAIL。
+$pass = $true          # 只在 B 阶段失败时置 false
+$skipped = $false      # A 阶段无法判定时置 true（注入被 ACE 拦）
 $injectOk = $true
 [T4]::SetCursorPos(400, 400) | Out-Null
 Start-Sleep -Milliseconds 150
@@ -98,8 +100,6 @@ if ($pt430.X -ne 400 -or $pt430.Y -ne 400) {
 }
 
 if ($injectOk) {
-$pass = $true
-$skipped = $false
     # ---------- A) 用户点击 PopTarget ----------
     # 先把焦点给对照组（也是真人式点击），再点被监控窗口 → 必须放行
     [T4]::ClickWindow($bgH)
@@ -118,7 +118,6 @@ $skipped = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match '前台变化 → PopTarget' -and $lines[$i] -match '按键=[0-9]+ms前@PopTarget') { $idx = $i; break }
     }
-    $pass = $true
     if ($idx -lt 0) { 'A 结果: 跳过（合成的点击没产生前台切换：注入被安全软件吃掉了，这一条无法判定）'; $skipped = $true }
     else {
         # 注意：点击放行时日志是「前台变化 → …」+「放行原因: 你点了这个窗口」；
@@ -132,7 +131,6 @@ $skipped = $false
         if ($blockedA) { 'A 结果: FAIL（用户点击被拦了）'; $pass = $false }
         else { 'A 结果: PASS（点击被识别为用户操作，未拦）' }
     }
-    else { 'A 结果: PASS（点击被识别为用户操作，未拦）' }
 
 } else { 'A 结果: 跳过（输入注入被安全软件拦了）'; $skipped = $true }
 
@@ -149,7 +147,14 @@ $partB = $now.Substring([Math]::Min($before, $now.Length))
 "=== B) PopTarget 自己抢前台之后的日志 ==="
 ($partB -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 6)
 $blocked = ([regex]::Matches($partB, '拦截 #')).Count
-if ($blocked -ge 1) { 'B 结果: PASS（无输入的强制抢前台被拦）' } else { 'B 结果: FAIL（没拦）'; $pass = $false }
+$raisedB = ([regex]::Matches($partB, '前台变化 → PopTarget')).Count
+if ($blocked -ge 1) { 'B 结果: PASS（无输入的强制抢前台被拦）' }
+elseif ($raisedB -eq 0) {
+    # PopTarget 的恢复动作有时被系统/守卫挡掉，前台根本没变过 —— 这时"没拦"不能算失败
+    "B 结果: 跳过（这次窗口没被真正抬到前台，抬了 0 次，无法判定）"
+    $skipped = $true
+}
+else { "B 结果: FAIL（抬了 $raisedB 次前台却一次都没拦）"; $pass = $false }
 
 Stop-Process -Id $guard.Id, $bg.Id, $pt.Id -Force -ErrorAction SilentlyContinue
 if (-not $pass) { '结果: FAIL'; exit 1 }
