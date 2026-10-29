@@ -63,6 +63,11 @@ $heartbeats = 0
 $unlockAllows = 0
 $wegameLoginAllows = 0
 $switchEvents = 0
+# 任务切换器（Alt+Tab 浮层 / 任务视图）认出来的次数，以及靠"一次性切换凭据"放行的次数。
+# 这台 Win11 上 EVENT_SYSTEM_SWITCH* 一次都不发（心跳里 切换器事件=0），所以切换动作
+# 只能按窗口身份认 —— 这两个数就是那条通道到底有没有在用的证据。
+$switcherSeen = 0
+$credAllow = 0
 # 只有"你在操作"的放行才参与复发配对。抑制期（正在放弃拦截期）、刚放行过这个窗口、刚解锁
 # 这些不是用户意图：拿它们配对必然误报 —— 抑制期一结束它再弹就被拦，间隔往往 <1.2 秒，
 # 结果被算成"你刚把它叫出来又被压回去"，而用户根本没叫过它。
@@ -119,6 +124,7 @@ foreach ($raw in $all) {
     if ($line -match '放行原因: ([^（]+)') {
         $r = $Matches[1].Trim()
         if ($allowReasons.ContainsKey($r)) { $allowReasons[$r]++ } else { $allowReasons[$r] = 1 }
+        if ($r -match 'Alt\+Tab|一次性凭据|任务视图') { $credAllow++ }
         # 记下"这次放的是谁"：放行行本身不带进程名，靠上一行「前台变化 → <proc>」配对
         # （普通日志没有「前台变化」行，所以复发检测只在 --verbose 日志上有效）
         if ($null -ne $tsNow -and $lastFgProc -ne '') {
@@ -172,6 +178,7 @@ foreach ($raw in $all) {
     }
     if ($line -match '监测到客户端/WeGame 已启动') { $clientStarts++; continue }
     if ($line -match '客户端/WeGame 已全部退出：本轮拦截 (\d+) 次') { $clientStops++; $sessionBlocks += [int]$Matches[1]; continue }
+    if ($line -match '识别到任务切换器') { $switcherSeen++; continue }
     if ($line -match '心跳 ') {
         $heartbeats++
         if ($line -match '切换器事件=(\d+)次') { $switchEvents = [int]$Matches[1] }
@@ -257,6 +264,9 @@ if ($autoOther -gt 0) {
     foreach ($l in $autoOtherLines) { "  $l" }
 }
 if ($heartbeats -gt 0) { "心跳行: $heartbeats 行（说明这局是 --verbose 跑的；切换器事件累计=$switchEvents）" }
+if ($switcherSeen -gt 0 -or $credAllow -gt 0) {
+    "任务切换器认出 $switcherSeen 次；靠一次性切换凭据放行 $credAllow 次（Alt+Tab/任务视图切到客户端、它慢半拍才画出来时，走的就是这条）"
+}
 if ($diagModal -gt 0 -or $diagFgNotRestored -gt 0 -or $diagOther -gt 0) {
     ''
     '--- 动作副作用诊断（--verbose 才记；真机上出现了要当回事）---'
@@ -300,6 +310,9 @@ if ($clientRunningBlocks -gt 0) {
     '· 这段没有客户端运行记录，① 这次没法验证'
 }
 
+if ($switcherSeen -gt 0 -and $credAllow -eq 0) {
+    "· 认出了 $switcherSeen 次任务切换器但没用上凭据：多半是你 Alt+Tab 后目标 1.5 秒内就上来了（被「Alt/Win 切换」那条先放行，属于正常）"
+}
 if ($clickAllows -gt 0) {
     "✓ 手动切窗口被识别成你的操作（$clickAllows 次）→ 没有把你自己的点击当自弹（② 目标达成方向）"
 } elseif ($totalBlocks -gt 0) {
