@@ -2025,33 +2025,7 @@ namespace LolFocusGuard
                             }
                         }
 
-                        // ---- 按住：对"对局就绪"这种会在几十毫秒内把自己顶回来的窗口 ----
-                        // 真机日志（21:55:43.332）：打回成功 14ms 后它又把前台抢回去，
-                        // 而重试要等 RETRY_MS 才轮到 —— 这中间它一直盖在你窗口上面，
-                        // 观感仍然是"匹配到对局时强制跳前台"。
-                        // 所以在动作线程里就地按住一小段（HOLD_DOWN_TOTAL_MS），
-                        // 它每顶回来一次就再压一次；一旦发现你正在切它（点击 / Alt+Tab 凭据）
-                        // 立刻收手，绝不跟你抢。
-                        long holdStart = Clock.NowMs();
-                        long holdUntil = holdStart + HOLD_DOWN_TOTAL_MS;
-                        int holds = 0;
-                        while (Clock.NowMs() < holdUntil)
-                        {
-                            System.Threading.Thread.Sleep(HOLD_DOWN_STEP_MS);
-                            if (!Native.IsWindow(hwnd)) break;
-                            // 你的切换动作（本次按住开始之后发生的）→ 让给你，收手
-                            if (_lastClickAt != Clock.Never && _lastClickAt >= holdStart) break;
-                            if (_switchCredentialAt != Clock.Never && _switchCredentialAt >= holdStart) break;
-                            if (Native.GetForegroundWindow() != hwnd) break;
-                            holds++;
-                            Native.ShowWindow(hwnd, SW_MINIMIZE);
-                            Native.PostMessage(hwnd, Native.WM_SYSCOMMAND, (IntPtr)Native.SC_MINIMIZE, IntPtr.Zero);
-                            if (restore != IntPtr.Zero && Native.IsWindow(restore)) ForceForeground(restore);
-                        }
-                        if (_verbose && holds > 0)
-                        {
-                            Log(string.Format("按住：它又抢了 {0} 次前台，都压回去了（{1}ms 内）", holds, HOLD_DOWN_TOTAL_MS));
-                        }
+
                     }
                     // 最小化后系统一般会把前台交给下一个窗口；没交就自己交还
                     IntPtr fgNow = Native.GetForegroundWindow();
@@ -2074,6 +2048,38 @@ namespace LolFocusGuard
                         {
                             Log("打回失败: 前台没能交还（目标窗口还占着前台）");
                         }
+                    }
+
+                    // ---- 按住：对"对局就绪"这种会在几十毫秒内把自己顶回来的窗口 ----
+                    // 真机日志（21:55:43.332）：打回成功 14ms 后它又把前台抢回去，
+                    // 而重试要等 RETRY_MS 才轮到 —— 这中间它一直盖在你窗口上面，
+                    // 观感仍然是"匹配到对局时强制跳前台"。
+                    // 所以在动作线程里就地按住一小段（HOLD_DOWN_TOTAL_MS）：它每顶回来一次就
+                    // 再压一次并把前台交还给你；一旦发现你正在切它（点击 / Alt+Tab 凭据）立刻收手。
+                    // 注意这段必须放在"交还前台"之后、且**两条打回路径都覆盖**：
+                    // 上面那条 `wasMinimized || restore == 0` 只是"需要最小化"的分支，
+                    // 而真机上最常见的是"只交还前台"那条（21:55:43 的 拦截 #3 就是），
+                    // 它交还完 14ms 就被顶回来 —— 那段空档正是用户看到"强制跳前台"的地方。
+                    long holdStart = Clock.NowMs();
+                    long holdUntil = holdStart + HOLD_DOWN_TOTAL_MS;
+                    int holds = 0;
+                    while (Clock.NowMs() < holdUntil)
+                    {
+                        if (Native.GetForegroundWindow() != hwnd) break;   // 它没在抢了，收手
+                        System.Threading.Thread.Sleep(HOLD_DOWN_STEP_MS);
+                        if (!Native.IsWindow(hwnd)) break;
+                        // 你的切换动作（本次按住开始之后发生的）→ 让给你，收手
+                        if (_lastClickAt != Clock.Never && _lastClickAt >= holdStart) break;
+                        if (_switchCredentialAt != Clock.Never && _switchCredentialAt >= holdStart) break;
+                        if (Native.GetForegroundWindow() != hwnd) break;
+                        holds++;
+                        Native.ShowWindow(hwnd, SW_MINIMIZE);
+                        Native.PostMessage(hwnd, Native.WM_SYSCOMMAND, (IntPtr)Native.SC_MINIMIZE, IntPtr.Zero);
+                        if (restore != IntPtr.Zero && Native.IsWindow(restore)) ForceForeground(restore);
+                    }
+                    if (_verbose && holds > 0)
+                    {
+                        Log(string.Format("按住：它又抢了 {0} 次前台，都压回去了（{1}ms 内）", holds, HOLD_DOWN_TOTAL_MS));
                     }
 
                     // 验收这次动作到底有没有把它从前台赶走（见 RecordBlockResult 的注释）。

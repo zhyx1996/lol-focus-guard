@@ -32,7 +32,7 @@ internal static class Program
         /// quiet = 不自动弹（窗口就静静待着）。给"需要确定前台顺序"的测试用：
         /// 自动弹的 FakeClient 每秒抢一次前台，Alt+Tab 的 MRU 顺序根本没法控制。
         /// </summary>
-        public FakeClient(bool quiet)
+        public FakeClient(bool quiet, int intervalMs)
         {
             _quiet = quiet;
             Text = "FakeClient";
@@ -41,7 +41,7 @@ internal static class Program
             Location = new Point(200, 150);
 
             _timer = new Timer();
-            _timer.Interval = 1200;
+            _timer.Interval = intervalMs;
             _timer.Tick += OnTick;
             if (_quiet) _timer.Enabled = false;
         }
@@ -101,7 +101,11 @@ internal static class Program
         Application.SetCompatibleTextRenderingDefault(false);
         Log("启动");
         bool quiet = args.Length > 0 && string.Equals(args[0], "quiet", StringComparison.OrdinalIgnoreCase);
+        // fast 模式：80ms 抢一次前台，用来模拟"对局就绪"那种被打回后立刻又顶回来的客户端
+        bool fast = !quiet && args.Length > 0 && string.Equals(args[0], "fast", StringComparison.OrdinalIgnoreCase);
+        int interval = fast ? 80 : 1200;
         if (quiet) Log("quiet 模式：不自动弹");
-        Application.Run(new FakeClient(quiet));
+        if (fast) Log("fast 模式：每 80ms 抢一次前台");
+        Application.Run(new FakeClient(quiet, interval));
     }
 }
