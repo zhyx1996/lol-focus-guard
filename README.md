@@ -236,6 +236,8 @@ pwsh ./test-input-rule.ps1       # 核心判据：模拟点击目标窗口=放�
 pwsh ./test-rules.ps1            # 真实判定链：客户端窗口首次出现放行→后续拦截、WeGame 卡片拦截/登录放行
 pwsh ./test-cursor-covered.ps1   # 弹窗正好盖住鼠标指针时必须照样拦（真机上漏拦的那个场景）
 pwsh ./test-restore.ps1          # "打回"这个动作本身：前台是否真的交还、窗口是否真被最小化
+pwsh ./test-click-late.ps1       # 竞态：抬前台的同时你点了它（点击证据晚到 30ms）→ 必须放弃这次打回
+pwsh ./test-soak.ps1            # 长时间回归：反复交替「你点它」和「它自己弹」，盯住两个方向都不退化
 pwsh ./test-live.ps1             # 需要真实客户端在运行（用真窗口再验一遍）
 ```
 
