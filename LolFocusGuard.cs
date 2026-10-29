@@ -329,7 +329,11 @@ namespace LolFocusGuard
         // 「拦了没压下去」的重试间隔。原来写死 1200ms：同一个窗口再次抢前台会被
         // ProcessForeground 开头的 hwnd == _lastFgHwnd 提前 return 吞掉，只能靠这个重试兜底，
         // 所以 1.2 秒就等于「每秒抢 16 次」那种场景下大半时间不设防。
-        private const int RETRY_MS = 400;
+        // 400 → 120：真机日志（21:55:43，对局就绪那一下）抓到客户端 14ms 内又把前台抢回去，
+        // 打回失败后要等 400ms 才重试 —— 这 400ms 里它就一直压在你窗口上面，
+        // 观感就是"匹配到对局时它还是强制跳出来"。120ms 足够让动作线程喘口气，
+        // 又不至于让你还能看到它。
+        private const int RETRY_MS = 120;
         private IntPtr _mouseHook = IntPtr.Zero;
         private IntPtr _kbdHook = IntPtr.Zero;
         private Native.LowLevelHookProc _mouseProc;
@@ -642,6 +646,12 @@ namespace LolFocusGuard
                     bool targetWindow = clickRecent && _targets.Contains(_lastClickWhere);
                     bool winPressed = modifierAge < blockAge && _lastModifierWasWin;
                     bool userTakingOver = FocusRules.IsSwitchGesture(shellEntry, targetWindow, winPressed);
+                    // 重试间隔压到 120ms 之后必须多这一道保险：你要是**在这 120ms 之前**就点了
+                    // 任务栏/客户端窗口（点击早于拦截，所以上面那条 clickRecent 不算），
+                    // 说明这一次是你在切它 —— 那就别再压，否则又变成"我点出来了它又被缩掉"。
+                    bool anyRecentSwitchClick = clickAge <= SHELL_CLICK_GRACE_MS &&
+                                                (shellEntry || (clickAge <= CLICK_GRACE_MS && targetWindow));
+                    if (anyRecentSwitchClick) userTakingOver = true;
 
                     if (_paused || Clock.AgeMs(_lastAllowAt) < blockAge || userTakingOver)
                     {
