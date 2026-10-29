@@ -16,6 +16,8 @@ internal static class Program
     private static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    private static extern bool EnableWindow(IntPtr hWnd, bool bEnable);
 
     private const int SW_MINIMIZE = 6;
     private const int SW_RESTORE = 9;
@@ -27,14 +29,16 @@ internal static class Program
         private readonly Timer _timer;
         private readonly bool _quiet;
         private bool _minimizedOnce;
+        private readonly bool _modal;
 
         /// <summary>
         /// quiet = 不自动弹（窗口就静静待着）。给"需要确定前台顺序"的测试用：
         /// 自动弹的 FakeClient 每秒抢一次前台，Alt+Tab 的 MRU 顺序根本没法控制。
         /// </summary>
-        public FakeClient(bool quiet, int intervalMs)
+        public FakeClient(bool quiet, int intervalMs, bool modal)
         {
             _quiet = quiet;
+            _modal = modal;
             Text = "FakeClient";
             ClientSize = new Size(420, 260);
             StartPosition = FormStartPosition.Manual;
@@ -49,6 +53,13 @@ internal static class Program
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
+            // modal 模式：把自己禁掉（EnableWindow(false)），这样 IsWindowEnabled=False ——
+            // 守卫会把它当成"带着模态弹窗的窗口"，用来验证"只抢前台、不最小化"那条路。
+            if (_modal)
+            {
+                EnableWindow(Handle, false);
+                Log("modal 模式：窗口已禁用（IsWindowEnabled=False），模拟带模态弹窗");
+            }
             if (!_quiet) _timer.Start();
         }
 
@@ -103,9 +114,10 @@ internal static class Program
         bool quiet = args.Length > 0 && string.Equals(args[0], "quiet", StringComparison.OrdinalIgnoreCase);
         // fast 模式：80ms 抢一次前台，用来模拟"对局就绪"那种被打回后立刻又顶回来的客户端
         bool fast = !quiet && args.Length > 0 && string.Equals(args[0], "fast", StringComparison.OrdinalIgnoreCase);
+        bool modal = !quiet && args.Length > 0 && string.Equals(args[0], "modal", StringComparison.OrdinalIgnoreCase);
         int interval = fast ? 80 : 1200;
         if (quiet) Log("quiet 模式：不自动弹");
         if (fast) Log("fast 模式：每 80ms 抢一次前台");
-        Application.Run(new FakeClient(quiet, interval));
+        Application.Run(new FakeClient(quiet, interval, modal));
     }
 }
