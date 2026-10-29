@@ -234,6 +234,31 @@ namespace LolFocusGuard
             return false;
         }
 
+        /// <summary>
+        /// 这个前台窗口是不是「任务切换器」本身（Alt+Tab 那个浮层、任务视图、以及切换过程中
+        /// 那个 0x0 的 ForegroundStaging）。
+        ///
+        /// 为什么要按窗口身份认：实测这台 Win11 上 `EVENT_SYSTEM_SWITCHSTART/SWITCHEND`
+        /// **一次都不发**（心跳里「切换器事件=0次」，而日志里明明有"任务切换"窗口出现）。
+        /// 于是"Alt+Tab 是用户的切换动作"这条证据完全没被采到，用户按 Alt+Tab 把客户端切出来
+        /// 会被当成"它自己弹的"打回去 —— 正是用户报的"想切出来切不出来"。
+        /// 所以看到这几个窗口就把 SWITCHEND 的宽限期打上（每次看见都续，最多 2.5 秒后自然过期）。
+        /// </summary>
+        public static bool IsSwitcherWindow(string proc, string title, string cls)
+        {
+            if (!IsShell(proc)) return false;
+            if (Eq(cls, "ForegroundStaging")) return true;
+            if (Eq(cls, "MultitaskingViewFrame")) return true;
+            if (Eq(cls, "TaskSwitcherWnd")) return true;
+            if (Eq(cls, "XamlExplorerHostIslandWindow"))
+            {
+                // 这个类也用于"任务视图/虚拟桌面"，标题是"任务切换"时就是 Alt+Tab 浮层；
+                // 其它标题（空/任务视图）一样算切换动作，用户确实在做窗口切换。
+                return true;
+            }
+            return false;
+        }
+
         private static bool Eq(string a, string b)
         {
             return string.Equals(a, b, StringComparison.OrdinalIgnoreCase);

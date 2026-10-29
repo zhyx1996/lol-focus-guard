@@ -34,6 +34,12 @@ internal static class LogicTest
         Report(name, actual == expect, expect ? "算 WeGame" : "不算 WeGame", actual ? "算 WeGame" : "不算 WeGame");
     }
 
+    private static void Switcher(string name, string proc, string title, string cls, bool expect)
+    {
+        bool actual = ProcClass.IsSwitcherWindow(proc, title, cls);
+        Report(name, actual == expect, expect ? "算切换器" : "不算切换器", actual ? "算切换器" : "不算切换器");
+    }
+
     private static void Client(string name, string proc, bool expect)
     {
         bool actual = ProcClass.IsClient(proc);
@@ -263,6 +269,13 @@ internal static class LogicTest
         Client("LeagueClientUx → 客户端", "LeagueClientUx", true);
         Client("RiotClientServices → 客户端", "RiotClientServices", true);
         Client("wegame → 不是客户端", "wegame", false);
+        // 任务切换器识别（Win11 不发 SWITCHSTART/END，只能按窗口身份认）
+        Switcher("Alt+Tab 浮层（XamlExplorerHostIslandWindow / 任务切换）→ 算切换器", "explorer", "任务切换", "XamlExplorerHostIslandWindow", true);
+        Switcher("ForegroundStaging（切换过程中的 0x0 窗口）→ 算切换器", "explorer", "", "ForegroundStaging", true);
+        Switcher("任务视图（MultitaskingViewFrame）→ 算切换器", "explorer", "", "MultitaskingViewFrame", true);
+        Switcher("任务栏本身（Shell_TrayWnd）→ 不算切换器（点击走证据那条路）", "explorer", "", "Shell_TrayWnd", false);
+        Switcher("记事本 → 不算切换器", "notepad", "*无标题 - 记事本", "Notepad", false);
+        Switcher("QQ 的窗口（同名类名但非 shell 进程）→ 不算切换器", "QQ", "任务切换", "XamlExplorerHostIslandWindow", false);
 
         Console.WriteLine();
         Console.WriteLine(string.Format("结果: {0}，通过 {1}，失败 {2}", _fail == 0 ? "PASS" : "FAIL", _pass, _fail));

@@ -1355,10 +1355,30 @@ namespace LolFocusGuard
                                 _lastClickWhere.Length > 0 ? _lastClickWhere : "?")));
                 }
 
+                // Win11 的任务切换器不发 SWITCHSTART/SWITCHEND（实测"切换器事件=0"），
+                // 只能按窗口身份认：看见它就等于"用户正在 Alt+Tab / 任务视图切窗口"，
+                // 把 SWITCHEND 的 2.5 秒宽限期打上，并**不消费**鼠标/按键证据。
+                // 不这么做的话：你按 Alt+Tab 切到客户端 → 我们当成它自己弹的 → 打回去 → 切不出来。
+                if (ProcClass.IsSwitcherWindow(proc, title, cls))
+                {
+                    long nowSwitch = Clock.NowMs();
+                    _lastSwitchStartAt = nowSwitch;
+                    _lastSwitchEndAt = nowSwitch;
+                    if (_verbose)
+                    {
+                        Log(string.Format("识别到任务切换器（class={0}，标题=\"{1}\"）：接下来 {2}ms 内切到的窗口算你切过去的",
+                            cls, title, FocusRules.SwitchEndGraceMs));
+                    }
+                    return;
+                }
+
                 if (!isTarget)
                 {
                     // 自己的窗口不算"可回退目标"
-                    if (IsTopLevel(hwnd) &&
+                    // 过渡窗口（ForegroundStaging / 任务视图）既不是"你要去的地方"，
+                    // 也不该把点击证据吃掉 —— 否则证据在中间窗口就被消费完，真正的目标窗口来了反而没凭据。
+                    bool transitional = ProcClass.IsSwitcherWindow(proc, title, cls);
+                    if (!transitional && IsTopLevel(hwnd) &&
                         !string.Equals(proc, OwnProcessName, StringComparison.OrdinalIgnoreCase))
                     {
                         _lastForeground = hwnd;
@@ -1366,7 +1386,7 @@ namespace LolFocusGuard
                     // 这一次前台变化如果是那一下点击引起的（比如点任务栏切到浏览器），
                     // 这份点击证据同样算"用掉了"。否则 2.5 秒内客户端自弹会搭这趟顺风车：
                     // 你点了任务栏去切浏览器，2 秒后客户端自己弹前台，还被判成"你点的"。
-                    ConsumeClickEvidenceIfUsed();
+                    if (!transitional) ConsumeClickEvidenceIfUsed();
                     return;
                 }
 
