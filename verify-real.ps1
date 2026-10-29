@@ -3,6 +3,8 @@
 # 用法（打完一局之后跑）：
 #   pwsh ./verify-real.ps1
 #   pwsh ./verify-real.ps1 -VerboseLog      # 如果你那局是 --verbose 跑的（判定依据更全）
+#   pwsh ./verify-real.ps1 -LastMinutes 40  # 只看最近 40 分钟（一局大概这么久；避免把上一局也算进来）
+#   pwsh ./verify-real.ps1 -LogPath "$env:LOCALAPPDATA\LolFocusGuard\archive-20261029-2334.log"  # 看归档日志
 #
 # 它只读日志，不动任何窗口、不影响守卫。检查的是这个项目的两个目标：
 #   ① 客户端/WeGame 在后台时自己抢前台 → 有没有被拦住
@@ -12,7 +14,11 @@
 # 再给判定（✓ / ! / ✗ 和下一步该看什么）。
 param(
     [string]$LogPath = (Join-Path $env:LOCALAPPDATA 'LolFocusGuard\guard.log'),
-    [switch]$VerboseLog
+    [switch]$VerboseLog,
+    # 只看最近这么多分钟的行（0 = 整份日志）。
+    # 打完一局来验收时用它：否则同一份日志里的上一局、甚至今天调 bug 的几百行都会一起被统计，
+    # 明明这一局干净，报告里却冒出"上一次的取消拦截/打回失败"。
+    [int]$LastMinutes = 0
 )
 $ErrorActionPreference = 'Stop'
 
@@ -37,6 +43,23 @@ if ($lines.Count -eq 0 -and $rotated.Count -eq 0) {
 $all = @()
 $all += $rotated
 $all += $lines
+
+# -LastMinutes：只留时间戳落在窗口内的行（认不出时间戳的行保留，宁可多算也不静默丢）
+$filteredOut = 0
+if ($LastMinutes -gt 0) {
+    $cutoff = (Get-Date).AddMinutes(-$LastMinutes)
+    $kept = New-Object System.Collections.ArrayList
+    foreach ($ln in $all) {
+        $t = $null
+        if ($ln.Length -ge 25 -and $ln[0] -eq '[') {
+            try { $t = [datetime]::ParseExact($ln.Substring(1, 23), 'yyyy-MM-dd HH:mm:ss.fff', $null) } catch { $t = $null }
+        }
+        if ($null -eq $t -or $t -ge $cutoff) { [void]$kept.Add($ln) } else { $filteredOut++ }
+    }
+    $all = @($kept)
+    "只统计最近 $LastMinutes 分钟（{0:HH:mm:ss} 之后）：留下 {1} 行，滤掉 {2} 行更早的" -f $cutoff, $all.Count, $filteredOut
+    ''
+}
 
 $firstTime = $null; $lastTime = $null
 $blockByWindow = @{}
