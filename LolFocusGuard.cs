@@ -466,16 +466,22 @@ namespace LolFocusGuard
             _pollThread.Name = "LolFocusGuard-poll";
             _pollThread.Start();
 
-            _actionThread = new System.Threading.Thread(ActionLoop);
+            _actionThread = StartActionThread("LolFocusGuard-action");
+            if (SelfTestActionStall)
+            {
+                Log("自测: 往动作线程塞一个 10 秒的任务 —— 看门狗应该在 3 秒后报「卡住」并补一个动作线程");
+                QueueAction(delegate
+                {
+                    System.Threading.Thread.Sleep(10000);
+                    Log("自测: 那个 10 秒的任务跑完了（线程没死，只是被拖住）");
+                });
+            }
             System.Threading.Thread clickThread = new System.Threading.Thread(ClickWatchLoop);
             clickThread.IsBackground = true;
             clickThread.Priority = System.Threading.ThreadPriority.AboveNormal;
             clickThread.Start();
 
-            _actionThread.IsBackground = true;
-            _actionThread.Priority = System.Threading.ThreadPriority.Highest;
-            _actionThread.Name = "LolFocusGuard-action";
-            _actionThread.Start();
+
 
             // 守卫启动前就已经存在的目标窗口不算"第一次出现"
             // 注意：这里刻意不把启动时已存在的窗口标记为"见过"——
@@ -601,6 +607,7 @@ namespace LolFocusGuard
                 // （IsRecentlyIconic 的窗口是 5 秒），400ms 采样足够。
                 if ((_scanTick++ % 8) == 0) ScanIconic();
                 // 进程是否在跑：枚举进程 1 秒一次没必要，2 秒足够（客户端起退的判定宽限是秒级）
+                if ((_scanTick % 10) == 0) WatchActionThread();
                 if ((_scanTick % 40) == 0) RefreshClientRunning();
                 // 只在客户端开着时才去看游戏进程（游戏不可能单独跑），平时零开销
                 if (_clientRunning && (_scanTick % 40) == 0) ObserveGameProcess();
@@ -1332,6 +1339,46 @@ namespace LolFocusGuard
             _actionSignal.Set();
         }
 
+        // ---------- 动作线程 + 卡死看门狗 ----------
+        // `AttachThreadInput` 会阻塞在目标线程的消息循环上（实测：测试工具 FakeGame 里同一个调用
+        // 整整挂住过一次，日志停在"全屏窗口已显示"之后再无输出）。如果守卫的动作线程卡在那里，
+        // 心跳照跳、日志照写，但**再也不会有任何拦截** —— 用户看到的就是"和没装一样"，
+        // 而日志里一句错误都没有。这是最难自查的失败模式，所以给它配一条看门狗：
+        // 一个动作超过 ACTION_STUCK_MS 没回来，就记日志并补偿式地再起一个动作线程。
+        // 旧线程若之后自己醒了，两个线程同时处理队列也只是多做一次幂等的最小化/交还，不会弄坏东西。
+        private const int ACTION_STUCK_MS = 3000;
+        internal static bool SelfTestActionStall;   // 仅 --selftest-action-stall 用：自测看门狗
+        private long _actionBusySince = Clock.Never;
+        private int _actionRestarts;
+        private int _actionWarnedForCurrentStall;
+
+        private System.Threading.Thread StartActionThread(string name)
+        {
+            System.Threading.Thread t = new System.Threading.Thread(ActionLoop);
+            t.IsBackground = true;
+            t.Priority = System.Threading.ThreadPriority.Highest;
+            t.Name = name;
+            t.Start();
+            return t;
+        }
+
+        private void WatchActionThread()
+        {
+            long since = System.Threading.Interlocked.Read(ref _actionBusySince);
+            if (since == Clock.Never)
+            {
+                System.Threading.Interlocked.Exchange(ref _actionWarnedForCurrentStall, 0);
+                return;
+            }
+            double age = Clock.AgeMs(since);
+            if (age < ACTION_STUCK_MS) return;
+            if (System.Threading.Interlocked.Exchange(ref _actionWarnedForCurrentStall, 1) == 1) return;
+            _actionRestarts++;
+            Log(string.Format("警告: 动作线程在同一个动作上卡了 {0:0.0} 秒（多半卡在 AttachThreadInput，被目标窗口的线程拖住了）—— 已补偿性再起一个动作线程（第 {1} 次）。如果之后还这样，把这个窗口的进程名发我",
+                age / 1000.0, _actionRestarts));
+            StartActionThread("LolFocusGuard-action" + (_actionRestarts + 1));
+        }
+
         private void ActionLoop()
         {
             while (!_disposed)
@@ -1346,6 +1393,7 @@ namespace LolFocusGuard
                     _actionSignal.WaitOne(200);
                     continue;
                 }
+                System.Threading.Interlocked.Exchange(ref _actionBusySince, Clock.NowMs());
                 try
                 {
                     job();
@@ -1353,6 +1401,10 @@ namespace LolFocusGuard
                 catch (Exception ex)
                 {
                     Log("动作失败: " + ex.Message);
+                }
+                finally
+                {
+                    System.Threading.Interlocked.Exchange(ref _actionBusySince, Clock.Never);
                 }
             }
         }
@@ -2166,6 +2218,15 @@ namespace LolFocusGuard
                     {
                         Log(string.Format("按住：它又抢了 {0} 次前台，都压回去了（{1}ms 内{2}）",
                             holds, HOLD_DOWN_TOTAL_MS, modalWindow ? "，模态窗口只抢前台不最小化" : ""));
+                    }
+
+                    // 观感数据：从"它抢到前台"到"前台已经不是它"一共花了多久。
+                    // 这就是用户真正被打断的时长（含判定 50ms 轮询 + 排队 + 最小化 + 交还 + 按住）。
+                    // 之前只能靠外面的量具去猜，现在守卫自己记 —— 一局打完 verify-real 直接给出中位数。
+                    if (_verbose && Native.GetForegroundWindow() != hwnd)
+                    {
+                        Log(string.Format("交还耗时: {0:0}ms（其中判定排队 {1}ms，其余是最小化+交还+按住）",
+                            Clock.AgeMs(requestAt), latency >= 0 ? latency.ToString() : "?"));
                     }
 
                     // 验收这次动作到底有没有把它从前台赶走（见 RecordBlockResult 的注释）。
@@ -3145,6 +3206,10 @@ namespace LolFocusGuard
                     else if (string.Equals(arg, "--verbose", StringComparison.OrdinalIgnoreCase))
                     {
                         verbose = true;
+                    }
+                    else if (string.Equals(arg, "--selftest-action-stall", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Guard.SelfTestActionStall = true; // 仅用于自测看门狗
                     }
                     else if (string.Equals(arg, "--no-click-allow", StringComparison.OrdinalIgnoreCase))
                     {

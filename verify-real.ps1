@@ -72,6 +72,8 @@ $cancelReasons = @{}
 #   「ShowWindow 被挡，改用 WM_SYSCOMMAND/SC_MINIMIZE 最小化成功」→ 兜底生效，是**成功**
 #   「打回失败: 前台没能交还」→ 最小化了，但焦点没还给你（全屏独占挡 SetForegroundWindow）
 $minFail = 0
+# 「交还耗时: Nms」= 从它抢到前台到前台不再是它（含判定排队+最小化+交还+按住）—— 你被打断的时长
+$handoffMs = New-Object System.Collections.ArrayList
 $fallbackMin = 0
 $handoffFail = 0
 # 两条动作副作用诊断（守卫里只在 --verbose 下写）
@@ -212,7 +214,8 @@ foreach ($raw in $all) {
     # 打回动作的三种结果，分开计（顺序不能换：「最小化失败」那行也含 ShowWindow 字样）
     if ($line -match '最小化失败') { $minFail++; continue }
     if ($line -match 'ShowWindow 被挡' -or ($line -match 'SC_MINIMIZE' -and $line -match '最小化成功')) { $fallbackMin++; continue }
-    if ($line -match '打回失败') { $handoffFail++; continue }
+    if ($line -match '交还耗时: (\d+)ms') { [void]$handoffMs.Add([int]$matches[1]) }
+if ($line -match '打回失败') { $handoffFail++; continue }
     if ($line -match '打回细节') { continue }   # 已知的可选细节行，不属于任何一档结果
     if ($line -match '打回') {                  # 措辞变了、上面三档都没认出来 → 单独露面，不要静默丢掉
         $autoOther++
@@ -302,6 +305,13 @@ if ($cancel -gt 0) {
 "最小化失败（ShowWindow 和 SC_MINIMIZE 都没生效，真没压下去）: $minFail 次"
 "ShowWindow 被挡 → 改用 SC_MINIMIZE 成功（兜底生效，不算失败）: $fallbackMin 次"
 "前台没能交还（已最小化，但焦点没回到你原来的窗口）: $handoffFail 次"
+if ($handoffMs.Count -gt 0) {
+    $sorted = $handoffMs | Sort-Object
+    "你被打断的时长（它抢到前台 → 前台拿回来）: 中位数 {0}ms，最长 {1}ms，样本 {2} 次" -f `
+        $sorted[[int]($handoffMs.Count / 2)], $sorted[$sorted.Count - 1], $handoffMs.Count
+} elseif ($totalBlocks -gt 0) {
+    "你被打断的时长: 这次没记到（那几次是普通日志跑的，`--verbose` 才记「交还耗时」）"
+}
 if ($autoOther -gt 0) {
     "打回相关但认不出类型的行（守卫可能改了措辞，点这条日志）: $autoOther 行"
     foreach ($l in $autoOtherLines) { "  $l" }
