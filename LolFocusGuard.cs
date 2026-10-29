@@ -602,6 +602,8 @@ namespace LolFocusGuard
                 if ((_scanTick++ % 8) == 0) ScanIconic();
                 // 进程是否在跑：枚举进程 1 秒一次没必要，2 秒足够（客户端起退的判定宽限是秒级）
                 if ((_scanTick % 40) == 0) RefreshClientRunning();
+                // 只在客户端开着时才去看游戏进程（游戏不可能单独跑），平时零开销
+                if (_clientRunning && (_scanTick % 40) == 0) ObserveGameProcess();
                 // 每 30 分钟留一行"我还活着"：长局/挂机几小时后，日志里能证明守卫一直在跑，
                 // 而不是半路退出（不然"没拦"到底是不该拦还是根本没在跑就分不清了）。
                 if (Clock.AgeMs(_lastAliveLogAt) > 30 * 60 * 1000)
@@ -949,6 +951,42 @@ namespace LolFocusGuard
         }
 
         /// <summary>客户端进程在不在（WeGame 登录窗口只在客户端起来之前出现，用它当判据）。</summary>
+        // ---------- 只做观测、绝不参与判定的"游戏进程"跟踪 ----------
+        // 待验证假设（README 已知局限里有写）：一局结束、游戏进程退出后，客户端常会自己顶到前台
+        // 显示结算页，而守卫只认"你有没有点它" —— 那一次大概率会被拦。
+        // 要不要为它开一个口子，得先有证据：客户端那次激活是不是紧跟在游戏进程退出之后。
+        // 所以这里只**记时间**（进程在/不在 + 退出时刻），并在拦截日志里带上"距游戏退出 N 秒"，
+        // 判定逻辑一个字都不改。等真机日志回来再决定。
+        private bool _gameRunning;
+        private long _gameExitedAt = Clock.Never;
+        private long _gameCheckAt = Clock.Never;
+
+        private void ObserveGameProcess()
+        {
+            if (Clock.AgeMs(_gameCheckAt) < 1500) return;
+            _gameCheckAt = Clock.NowMs();
+            bool running = false;
+            try
+            {
+                Process[] ps = Process.GetProcessesByName("League of Legends");
+                running = ps.Length > 0;
+                foreach (Process p in ps) p.Dispose();
+            }
+            catch
+            {
+            }
+            if (_gameRunning && !running)
+            {
+                _gameExitedAt = Clock.NowMs();
+                Log("观测: 游戏进程（League of Legends.exe）退出 —— 接下来客户端若自己跳前台，拦截日志里会标「距游戏退出 N 秒」");
+            }
+            else if (!_gameRunning && running)
+            {
+                Log("观测: 游戏进程（League of Legends.exe）启动（游戏内不干预，只为排查这条时序）");
+            }
+            _gameRunning = running;
+        }
+
         private void RefreshClientRunning()
         {
             if (Clock.AgeMs(_clientCheckAt) < 800) return;
@@ -2006,7 +2044,10 @@ namespace LolFocusGuard
                     Log(string.Format("拦截 #{0}：{1} (pid={2}) 自己弹到前台（刚才最小化={3}{4}，class={5}，标题=\"{6}\"，尺寸={7}，事件延迟={8}ms）→ 打回",
                         number, proc, pid, wasMinimized ? "是" : "否",
                         escalating ? "，连续弹" : "", cls, title, size,
-                        latency >= 0 ? latency.ToString() : "?"));
+                        latency >= 0 ? latency.ToString() : "?") +
+                        (_gameExitedAt != Clock.Never && Clock.AgeMs(_gameExitedAt) < 15000
+                            ? string.Format("（**距游戏进程退出 {0:0.0} 秒**）", Clock.AgeMs(_gameExitedAt) / 1000.0)
+                            : ""));
 
                     // 没有可以交还的窗口时（比如上一个前台窗口本身也在监控名单里），
                     // 光"不还焦点"等于什么都没做，那就直接把它最小化掉，让系统自己挑下一个窗口。
