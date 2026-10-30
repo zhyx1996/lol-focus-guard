@@ -298,6 +298,10 @@ namespace LolFocusGuard
         // "点击 → 窗口被激活"这条链上前台事件可能比点击证据先到。
         private const int LATE_EVIDENCE_WAIT_MS = 30;
 
+        // 「它自己是最小化状态却抢了前台」给多久的宽限去自己还原出来。
+        // 客户端从最小化还原通常 100~300ms；400ms 还没还原，就是它赖在一个看不见的窗口上占前台。
+        private const int SELF_MIN_RECHECK_MS = 400;
+
         // pid → 进程名缓存（热路径里不能每 50ms 都去 new Process，那是几十毫秒的开销）
         private readonly Dictionary<int, string> _pidNames = new Dictionary<int, string>();
         private long _pidNamesClearedAt = Clock.NowMs();
@@ -349,6 +353,14 @@ namespace LolFocusGuard
         private volatile int _inputAgeMs = int.MaxValue; // 最后一次输入距今（系统级，不信钩子）
         private long _lastAllowAt = Clock.Never;
         private IntPtr _lastAllowHwnd = IntPtr.Zero;
+        // 「它自己是最小化状态却抢了前台」的待复查记录。
+        // 为什么要复查：那个窗口不画任何像素（尺寸 237x39@-32000,-32000），如果一直占着前台，
+        // 你屏幕上看得到自己的窗口、但键盘输入全打进这个看不见的窗口 —— 比被压回去更糟。
+        // 但也不能立刻抢：客户端"最小化 → 还原"的过程中，它就是先以图标状态占一瞬间前台，
+        // 立刻抢回来等于打断它自己的还原（那正是"点好几遍才切出来"的来源）。
+        // 所以给它 SELF_MIN_RECHECK_MS 的宽限：还在原样占着 → 只交还前台、不最小化。
+        private IntPtr _selfMinHwnd = IntPtr.Zero;
+        private long _selfMinAt = Clock.Never;
         private volatile string _lastAllowProc = "";
         // 待打回的目标窗口：只有「拦过一次、它又赖在前台」才重试；用户一接管就作废
         private IntPtr _pendingBlockHwnd = IntPtr.Zero;
@@ -606,6 +618,8 @@ namespace LolFocusGuard
                 // 要判的是"弹出之前是不是最小化的"，真实场景里最小化状态至少保持几百毫秒
                 // （IsRecentlyIconic 的窗口是 5 秒），400ms 采样足够。
                 if ((_scanTick++ % 8) == 0) ScanIconic();
+                // 复查"最小化窗口占着前台"的情况（每 100ms 一次，够快也不费）
+                if ((_scanTick % 2) == 0) RecheckSelfMinimizedForeground();
                 // 进程是否在跑：枚举进程 1 秒一次没必要，2 秒足够（客户端起退的判定宽限是秒级）
                 if ((_scanTick % 10) == 0) WatchActionThread();
                 if ((_scanTick % 40) == 0) RefreshClientRunning();
@@ -1362,6 +1376,65 @@ namespace LolFocusGuard
             return t;
         }
 
+        /// <summary>
+        /// 复查"最小化状态的窗口占着前台"。
+        ///
+        /// 场景（真机 + 测试都复现过）：一个 237x39@(-32000,-32000)、IsIconic=True 的窗口
+        /// 反复把前台抢到自己身上。它不画任何像素 —— 你屏幕上看得到自己的窗口，
+        /// 但键盘输入全打进这个看不见的窗口。**比被压回去更糟**，而且很难自己诊断。
+        ///
+        /// 但也不能一看见就抢：客户端"最小化 → 还原"的过程中，它就是先以图标状态占一瞬间前台，
+        /// 立刻抢回来等于打断它自己的还原（那正是"点好几遍才切出来"的来源）。
+        ///
+        /// 所以给 SELF_MIN_RECHECK_MS 的宽限：
+        ///   · 宽限内它还原了（不再占前台 / 不再是图标状态）→ 什么都不做，这就是我们要的"不打断"；
+        ///   · 宽限过了还赖着 → 只**交还前台**给你，不最小化它（它本来就是图标状态）。
+        /// </summary>
+        private void RecheckSelfMinimizedForeground()
+        {
+            IntPtr h = _selfMinHwnd;
+            if (h == IntPtr.Zero) return;
+            if (_disposed) return;
+
+            // 已经不再占前台 → 它自己还原/退让了，收工
+            if (Native.GetForegroundWindow() != h)
+            {
+                _selfMinHwnd = IntPtr.Zero;
+                return;
+            }
+            if (!Native.IsWindow(h))
+            {
+                _selfMinHwnd = IntPtr.Zero;
+                return;
+            }
+            // 它变成正常窗口了（不是图标状态）→ 这是它还原出来了，交给正常判定流程
+            if (!Native.IsIconic(h))
+            {
+                _selfMinHwnd = IntPtr.Zero;
+                return;
+            }
+            if (Clock.AgeMs(_selfMinAt) < SELF_MIN_RECHECK_MS) return;   // 还在宽限里，别动
+
+            // 宽限已过，它还以最小化状态占着前台 —— 把前台还给你（不最小化它）
+            _selfMinHwnd = IntPtr.Zero;
+            IntPtr restore = _lastForeground;
+            if (restore == IntPtr.Zero || !Native.IsWindow(restore) || restore == h)
+            {
+                // 没有可交还的窗口：至少用 SwitchToThisWindow 把前台让给系统自己挑一个
+                if (_verbose)
+                {
+                    Log("复查: 最小化窗口占着前台超过 " + SELF_MIN_RECHECK_MS + "ms，但没有可交还的窗口 —— 不动它（会自己还原）");
+                }
+                return;
+            }
+            ForceForeground(restore);
+            if (_verbose)
+            {
+                Log(string.Format("复查: 最小化窗口占着前台超过 {0}ms 还没还原 → 只把前台交还给你（{1}），不最小化它",
+                    SELF_MIN_RECHECK_MS, ProcNameOfCached(restore)));
+            }
+        }
+
         private void WatchActionThread()
         {
             long since = System.Threading.Interlocked.Read(ref _actionBusySince);
@@ -1704,6 +1777,11 @@ namespace LolFocusGuard
                             ? string.Format("放行原因: 它自己就是最小化状态（指针在 {0}），压回去只会打断它的还原", where)
                             : "放行原因: 它自己就是最小化状态，压回去只会打断它的还原");
                     }
+                    // 记下来复查：给客户端 SELF_MIN_RECHECK_MS 自己还原出来。
+                    // 还还原不出来，就说明它赖在这个看不见的窗口上占前台 —— 那时候要交还前台
+                    // （不最小化：它本来就是图标状态，最小化没意义，还会打断它自己的还原）。
+                    _selfMinHwnd = hwnd;
+                    _selfMinAt = Clock.NowMs();
                     break;
                 case DecisionCode.AllowWeGameLaunch:
                     if (_verbose)
