@@ -54,9 +54,18 @@ public class S2 {
     SetWindowPos(h, (IntPtr)(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040);
     System.Threading.Thread.Sleep(200);
     RECT r; if (!GetWindowRect(h, out r)) return false;
+    // 关键：窗口如果已经被守卫压回最小化，GetWindowRect 会返回 (-32000,-32000)，
+    // 这时算出来的中心点在屏幕外，点下去等于没点（守卫也就看不到"你点了它"）。
+    // 真机上用户点的是**任务栏**（有 2500ms 长宽限），不是直接点窗口；这里至少要先确认
+    // 窗口确实在屏幕内可见，否则宁可不点 —— 让这一轮按"没测到"处理，而不是算成 FAIL。
+    if (r.Left <= -30000 || r.Top <= -30000) return false;
     int x = (r.Left + r.Right) / 2, y = (r.Top + r.Bottom) / 2;
     if (!SetCursorPos(x, y)) return false;
-    System.Threading.Thread.Sleep(80);
+    // 点下去之前再确认一次指针真的到了窗口上：SetCursorPos 被 ACE 拦掉时它返回 true 但指针不动，
+    // 这时点击会落到别的程序上，"没测到点击"会被误判成守卫漏拦。
+    POINT now; if (!GetCursorPos(out now)) return false;
+    if (Math.Abs(now.X - x) > 3 || Math.Abs(now.Y - y) > 3) return false;
+    System.Threading.Thread.Sleep(30);
     INPUT[] d = new INPUT[1]; d[0].type = 0; d[0].mi.dwFlags = 0x0002;
     INPUT[] u = new INPUT[1]; u[0].type = 0; u[0].mi.dwFlags = 0x0004;
     SendInput(1, d, Marshal.SizeOf(typeof(INPUT)));
@@ -168,7 +177,7 @@ if (-not $skipped) {
         }
         if (-not $restored) { "  第 $i 轮：窗口没恢复，跳过"; continue }
         $clicked = [S2]::ClickWindow($ptH)
-        if (-not $clicked) { "  第 $i 轮：点击没发出去（注入失败）"; $skipped = $true; break }
+        if (-not $clicked) { "  第 $i 轮：没点成（窗口已被压回最小化 / 指针被拦 / 注入被吞），本轮不计结论"; continue }
         Start-Sleep -Milliseconds 900
 
         $part = Read-LogSince $beforeLen
@@ -177,7 +186,11 @@ if (-not $skipped) {
         # 用户真正痛的是"点了还被压回去"，所以从"放行原因: 你点了这个窗口"那一行往后数拦截。
         $allowIdx = -1
         for ($j = 0; $j -lt $linesA.Count; $j++) {
-            if ($linesA[$j] -match '放行原因: 你点了这个窗口') { $allowIdx = $j }
+            # 两种放行都算"它被允许留在前台"：
+            #   · 你点了这个窗口（点击证据）
+            #   · 它自己就是最小化状态（窗口还处于图标状态就来抢前台 —— 压回去只会打断它自己的还原）
+            # 第二条是后加的（规则 0.5）。只认第一条的话，脚本会把"已经放行了"误报成"没测到"。
+            if ($linesA[$j] -match '放行原因: 你点了这个窗口|放行原因: 它自己就是最小化状态') { $allowIdx = $j }
         }
         $blocksBefore = ([regex]::Matches($part, '拦截 #\d+：PopTarget')).Count
         if ($allowIdx -lt 0) {
