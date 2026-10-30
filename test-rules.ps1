@@ -57,13 +57,41 @@ if ($firstAllow -ge 1 -and $blocked1 -ge 1) { '阶段 1: PASS（第一次放行�
 elseif ($firstAllow -eq 0) { '阶段 1: FAIL（第一次出现没放行，登录页会被拦）'; $fail++ }
 else { '阶段 1: FAIL（后续自弹没拦住）'; $fail++ }
 
-# ---- 阶段 2：客户端在跑 + WeGame 自弹 → 应该拦 ----
+# ---- 阶段 2：客户端刚起来（启动宽限期内）+ WeGame 自弹 → 应该**放行** ----
+# 为什么改：原来这里断言"应该拦"，但守卫有一条 `WeGameLaunchGraceMs = 20000` 的启动宽限
+# （真机依据：你用 WeGame 启动 LoL 后，WeGame 自己会把窗口递上来，不放行就会把它缩掉两次）。
+# 本阶段的时间线只有 ~10 秒，正好落在宽限里，所以守卫放行是**对的**，是测试预期过时了。
+# 现在改成同时验两条：宽限期内放行（这里），宽限期外拦截（阶段 2b）。
 $wg = Start-Process (Join-Path $tmp 'wegame.exe') -PassThru
-Start-Sleep -Seconds 8
+Start-Sleep -Seconds 6
 $part2 = (Get-Content $guardLog -Raw)
+$allowGrace = ([regex]::Matches($part2, '放行原因: WeGame 启动流程')).Count
 $blockWg = ([regex]::Matches($part2, '拦截 #\d+：wegame')).Count
-"阶段 2：客户端在跑时 WeGame 自弹被拦 $blockWg 次"
-if ($blockWg -ge 1) { '阶段 2: PASS（客户端在跑时 WeGame 弹前台被拦）' } else { '阶段 2: FAIL（卡片没拦住）'; $fail++ }
+"阶段 2：启动宽限期内 WeGame 自弹 —— 放行 $allowGrace 次，拦截 $blockWg 次"
+if ($allowGrace -ge 1 -and $blockWg -eq 0) {
+    '阶段 2: PASS（启动宽限期内放行 WeGame 的卡片，一次没误拦）'
+} elseif ($blockWg -ge 1) {
+    '阶段 2: FAIL（宽限期内就把 WeGame 卡片拦了，真机上会把启动流程缩掉）'; $fail++
+} else {
+    '阶段 2: FAIL（既没放行也没拦截 —— WeGame 窗口根本没抢到前台？）'; $fail++
+}
+
+# ---- 阶段 2b：过了启动宽限期，客户端还在跑 + WeGame 自弹 → 应该拦 ----
+# 等宽限过期：守卫是从"客户端第一次被检测到"开始计 20 秒，这里补足剩余时间。
+Start-Sleep -Seconds 12
+$wgB = Start-Process (Join-Path $tmp 'wegame.exe') -PassThru
+Start-Sleep -Seconds 6
+$part2b = (Get-Content $guardLog -Raw)
+$blockWgB = ([regex]::Matches($part2b, '拦截 #\d+：wegame')).Count
+"阶段 2b：宽限期过后 WeGame 自弹被拦 $blockWgB 次"
+if ($blockWgB -ge 1) {
+    '阶段 2b: PASS（宽限期一过，WeGame 再抢前台就拦）'
+} else {
+    $graceLine = @($part2b -split "`r?`n" | Where-Object { $_ -match 'wegame' } | Select-Object -Last 3) -join "`n"
+    "阶段 2b: FAIL（宽限期过了还没拦，真机上就是卡片一直抢前台）`n$graceLine"; $fail++
+}
+Stop-Process -Id $wgB.Id -Force -ErrorAction SilentlyContinue
+
 
 # ---- 阶段 3：客户端没跑 + WeGame 自弹 → 应该放行 ----
 Stop-Process -Id $client.Id -Force -ErrorAction SilentlyContinue
