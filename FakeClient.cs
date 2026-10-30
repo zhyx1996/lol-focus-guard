@@ -73,9 +73,13 @@ internal static class Program
                 // minimized 模式：保持最小化，却把 SetForegroundWindow 打在自己的（图标状态）窗口上 ——
                 // 真机 22:17:18 的 `尺寸=237x39@(-32000,-32000) 最小化=True` 就是这个动作。
                 // 守卫应该回一句"放行原因: 它自己就是最小化状态"，而不是把它打回。
+                //
+                // 注意要**持续**抢：只抢一次的话，几十毫秒后系统/别的窗口就把前台拿回去了，
+                // 守卫的 400ms 复查会看到"它已经不在前台了"从而正确地收工 ——
+                // 那样测不出"赖着不走"这条路径。所以每 tick 都抢，模拟它一直占着前台。
                 if (_stayMinimized)
                 {
-                    SetForegroundWindow(Handle);
+                    if (GetForegroundWindow() != Handle) SetForegroundWindow(Handle);
                     Log("raise-while-minimized ok=" + (GetForegroundWindow() == Handle));
                     return;
                 }

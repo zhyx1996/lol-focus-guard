@@ -1427,12 +1427,30 @@ namespace LolFocusGuard
                 }
                 return;
             }
-            ForceForeground(restore);
-            if (_verbose)
+
+            // **必须丢给动作线程**：ForceForeground 里有 AttachThreadInput，它会阻塞在目标线程的
+            // 消息循环上（动作线程看门狗就是为这个加的）。这里是轮询线程 —— 一旦卡在这儿，
+            // 心跳、目标刷新、客户端起退检测、看门狗全部停摆，等于守卫悄悄死掉。
+            IntPtr target = restore;
+            QueueAction(delegate
             {
-                Log(string.Format("复查: 最小化窗口占着前台超过 {0}ms 还没还原 → 只把前台交还给你（{1}），不最小化它",
-                    SELF_MIN_RECHECK_MS, ProcNameOfCached(restore)));
-            }
+                try
+                {
+                    // 排队期间它可能已经自己还原了 / 你已经手动切走了，那就不用动了
+                    if (Native.GetForegroundWindow() != h) return;
+                    if (!Native.IsWindow(h) || !Native.IsIconic(h)) return;
+                    ForceForeground(target);
+                    if (_verbose)
+                    {
+                        Log(string.Format("复查: 最小化窗口占着前台超过 {0}ms 还没还原 → 只把前台交还给你（{1}），不最小化它",
+                            SELF_MIN_RECHECK_MS, ProcNameOfCached(target)));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log("复查交还前台出错: " + ex.Message);
+                }
+            });
         }
 
         private void WatchActionThread()
