@@ -1934,6 +1934,29 @@ namespace LolFocusGuard
                             _lastModifierAt = Clock.NowMs();
                             _lastModifierWasWin = (info.vkCode == 0x5B || info.vkCode == 0x5C);
                         }
+                        // Tab 也要在这里接：**钩子是逐键事件，采样是 50ms 轮询**。
+                        // 快按一下 Alt+Tab（Tab 只按住 30~60ms）很可能整个落在两次采样之间 ——
+                        // 采样那条路就会漏掉，而钩子一个键都不会漏。
+                        // 钩子每收到一次 KEYDOWN 才来一次，天然是"边沿"，不用再自己记按下状态。
+                        // 判定"Alt/Win 是否按着"仍用 GetAsyncKeyState：钩子只给了这一个键，
+                        // 修饰键的真实状态得问系统（ACE 掐的是别人的钩子，掐不掉这个查询）。
+                        if (info.vkCode == Native.VK_TAB)
+                        {
+                            bool altNow = (Native.GetAsyncKeyState(Native.VK_MENU) & 0x8000) != 0;
+                            bool winNow = (Native.GetAsyncKeyState(Native.VK_LWIN) & 0x8000) != 0 ||
+                                          (Native.GetAsyncKeyState(Native.VK_RWIN) & 0x8000) != 0;
+                            if (altNow || winNow)
+                            {
+                                _switchCredentialAt = Clock.NowMs();
+                                _lastModifierAt = Clock.NowMs();
+                                _lastModifierWasWin = winNow;
+                                if (_verbose)
+                                {
+                                    Log(string.Format("识别到 {0}+Tab 按键（键盘钩子）：给你下一次窗口激活一张一次性凭据（{1}ms 内有效）",
+                                        winNow ? "Win" : "Alt", FocusRules.SwitchCredentialMs));
+                                }
+                            }
+                        }
                     }
                 }
                 catch
