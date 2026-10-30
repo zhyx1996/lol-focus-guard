@@ -236,7 +236,16 @@ namespace LolFocusGuard
 
         // 「按住」：被打回后客户端常会在几十毫秒内自己顶回来（对局就绪尤其明显）。
         // 动作线程里就地按住这么久，每次顶回来就再压一次，发现你在切它立刻收手。
-        private const int HOLD_DOWN_TOTAL_MS = 300;
+        //
+        // 为什么从 300ms 提到 900ms（真机+量具实测）：全屏游戏（FakeGame 模拟）在前台时，
+        // 守卫自己记的「交还耗时」中位数只有 188ms —— 前台确实在 200ms 内就还回去了；
+        // 但**全屏窗口真正恢复前台/恢复渲染要 ~950ms**。按住只跑 300ms，剩下的 600ms 里
+        // 客户端每次再抢，守卫都要重新走一遍"事件 → 排队 → 最小化 → 交还"，
+        // 而这段空档里它就一直盖在游戏上面。实测 31 次拦截里 25 次间隔 >400ms，
+        // 正好卡在按住结束之后。
+        // 现在改成"只要前台还没回到你手上就一直按，最多 900ms"（正常情况它顶一次就收手，
+        // 根本跑不满）；你一旦有切换动作（点击 / Alt+Tab）立刻收手，不会抢你的操作。
+        private const int HOLD_DOWN_TOTAL_MS = 900;
         private const int HOLD_DOWN_STEP_MS = 60;
 
         private readonly HashSet<string> _targets;
