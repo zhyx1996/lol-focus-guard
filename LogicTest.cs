@@ -40,6 +40,13 @@ internal static class LogicTest
         Report(name, actual == expect, expect ? "算切换器" : "不算切换器", actual ? "算切换器" : "不算切换器");
     }
 
+    /// <summary>断言"这个窗口类名算不算任务栏本体"（决定 2500ms 还是 350ms 宽限）。</summary>
+    private static void Taskbar(string name, string cls, bool expect)
+    {
+        bool actual = ProcClass.IsTaskbarClass(cls);
+        Report(name, actual == expect, expect ? "算任务栏" : "不算任务栏", actual ? "算任务栏" : "不算任务栏");
+    }
+
     private static void Client(string name, string proc, bool expect)
     {
         bool actual = ProcClass.IsClient(proc);
@@ -316,6 +323,18 @@ internal static class LogicTest
         Switcher("任务栏本身（Shell_TrayWnd）→ 不算切换器（点击走证据那条路）", "explorer", "", "Shell_TrayWnd", false);
         Switcher("记事本 → 不算切换器", "notepad", "*无标题 - 记事本", "Notepad", false);
         Switcher("QQ 的窗口（同名类名但非 shell 进程）→ 不算切换器", "QQ", "任务切换", "XamlExplorerHostIslandWindow", false);
+        // ---- 任务栏分类：决定"点任务栏"能拿 2500ms 长宽限还是 350ms ----
+        // 这几条要是错了，症状是"点任务栏叫不出客户端"，而 Rules.Decide 的测试全绿
+        //（它只看 ClickOnShell，不知道宽限是谁给的）。所以分类本身必须穷举锁住。
+        Taskbar("主屏任务栏 Shell_TrayWnd → 长宽限", "Shell_TrayWnd", true);
+        Taskbar("副屏任务栏 Shell_SecondaryTrayWnd → 长宽限", "Shell_SecondaryTrayWnd", true);
+        Taskbar("任务栏缩略图预览 TaskListThumbnailWnd → 长宽限（也是从最小化恢复）", "TaskListThumbnailWnd", true);
+        Taskbar("托盘溢出面板 → 不算任务栏（激活很快，只给 350ms）", "TopLevelWindowForOverflowXamlIsland", false);
+        Taskbar("开始菜单/通知中心 → 不算任务栏", "Windows.UI.Core.CoreWindow", false);
+        Taskbar("任务视图 → 不算任务栏", "MultitaskingViewFrame", false);
+        Taskbar("资源管理器文件夹窗口 → 不算任务栏（不是点击入口）", "CabinetWClass", false);
+        Taskbar("空类名 → 不算任务栏", "", false);
+        Taskbar("大小写不同也要认（shell 类名不保证大小写）", "shell_traywnd", true);
 
         Console.WriteLine();
         Console.WriteLine(string.Format("结果: {0}，通过 {1}，失败 {2}", _fail == 0 ? "PASS" : "FAIL", _pass, _fail));

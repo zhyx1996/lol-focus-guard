@@ -300,6 +300,25 @@ namespace LolFocusGuard
         /// 会被当成"它自己弹的"打回去 —— 正是用户报的"想切出来切不出来"。
         /// 所以看到这几个窗口就把 SWITCHEND 的宽限期打上（每次看见都续，最多 2.5 秒后自然过期）。
         /// </summary>
+        /// <summary>
+        /// 这个窗口类名算不算"任务栏本体"（享受 2500ms 长宽限的那种）。
+        ///
+        /// 为什么要单独暴露成纯函数：守卫里是这么用的 ——
+        ///   clickOnTaskbar = shellEntry && IsTaskbarClass(cls)
+        ///   shellGraceMs   = clickOnTaskbar ? 2500 : 350
+        /// 也就是说**点任务栏**给 2.5 秒（从按下到客户端窗口真正被激活可能要几百毫秒，
+        /// 从最小化恢复尤其慢），而托盘溢出/开始菜单/任务视图只给 350ms。
+        /// 这个分类要是错了，症状是"点任务栏叫不出客户端"，而纯函数测试全绿 ——
+        /// 因为 Rules.Decide 只看 ClickOnShell，不知道 2500/350 是谁给的。
+        /// 所以把分类本身也做成可穷举测试的纯函数。
+        /// </summary>
+        public static bool IsTaskbarClass(string cls)
+        {
+            return Eq(cls, "Shell_TrayWnd")            // 主屏任务栏
+                || Eq(cls, "Shell_SecondaryTrayWnd")   // 副屏任务栏
+                || Eq(cls, "TaskListThumbnailWnd");    // 任务栏上的缩略图预览（也是"从最小化恢复"）
+        }
+
         public static bool IsSwitcherWindow(string proc, string title, string cls)
         {
             if (!IsShell(proc)) return false;

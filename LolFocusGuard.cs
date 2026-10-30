@@ -959,12 +959,9 @@ namespace LolFocusGuard
         /// 缩略图预览（TaskListThumbnailWnd）是"点任务栏上那个小预览把最小化窗口叫回来"，
         /// 和任务栏一样是从最小化恢复，激活可能要几百毫秒 —— 按 350ms 算会误拦用户。
         /// </summary>
-        private static bool IsTaskbarClass(string cls)
-        {
-            return string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
-                   string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) ||
-                   string.Equals(cls, "TaskListThumbnailWnd", StringComparison.OrdinalIgnoreCase);
-        }
+        // 逻辑挪到 Rules.IsTaskbarClass：那是纯函数，能被 LogicTest 穷举测到。
+        // 留这个转发只是为了不改动调用点（ClassUnderPoint / 1725 行附近都用它）。
+        private static bool IsTaskbarClass(string cls) { return ProcClass.IsTaskbarClass(cls); }
 
         /// <summary>这是不是 shell 的"点击入口"（任务栏 / 托盘溢出 / 开始菜单 / 任务视图 / 缩略图预览）。</summary>
         private static bool IsShellClickClass(string cls)
