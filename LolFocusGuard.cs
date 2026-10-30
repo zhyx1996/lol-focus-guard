@@ -2311,9 +2311,16 @@ namespace LolFocusGuard
                     while (Clock.NowMs() < holdUntil)
                     {
                         if (Native.GetForegroundWindow() != hwnd) break;   // 它没在抢了，收手
+                        // 你的切换动作（本次按住开始之后发生的）→ 让给你，收手。
+                        // **sleep 前后各查一次**：按住从 300ms 拉到 900ms 之后，一轮 60ms 的
+                        // 空窗最多会多压一次（点击落在 sleep 里，醒来看见证据时已经又压了一下）。
+                        // 按压一次 ~15ms 算，900ms 里最多多压 15 次 —— 你"点了它想叫出来用"
+                        // 的体感就是"我点了它还在跟我抢"。所以进 sleep 之前先查一遍。
+                        if (_lastClickAt != Clock.Never && _lastClickAt >= holdStart) break;
+                        if (_switchCredentialAt != Clock.Never && _switchCredentialAt >= holdStart) break;
                         System.Threading.Thread.Sleep(HOLD_DOWN_STEP_MS);
                         if (!Native.IsWindow(hwnd)) break;
-                        // 你的切换动作（本次按住开始之后发生的）→ 让给你，收手
+                        // 醒过来再查一遍：这 60ms 里你可能刚点了它 / 刚按了 Alt+Tab
                         if (_lastClickAt != Clock.Never && _lastClickAt >= holdStart) break;
                         if (_switchCredentialAt != Clock.Never && _switchCredentialAt >= holdStart) break;
                         if (Native.GetForegroundWindow() != hwnd) break;
