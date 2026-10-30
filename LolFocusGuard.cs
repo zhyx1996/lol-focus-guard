@@ -289,6 +289,9 @@ namespace LolFocusGuard
         // 守卫启动时刻 + 上一次"我还在跑"心跳的时刻（每 30 分钟一行，证明长局里没半路退出）
         private long _startedAtMs = Clock.NowMs();
         private long _lastAliveLogAt = Clock.NowMs();
+        // 轮询里出错时的限频记录（见 PollOnce 的 catch）
+        private long _pollErrorAt = Clock.Never;
+        private int _pollErrorCount;
         // 每个目标窗口"上一次处于最小化"的时间，用来判断弹出来的那一刻它是不是从最小化状态恢复的
         private readonly Dictionary<IntPtr, long> _iconicAt = new Dictionary<IntPtr, long>();
         private readonly List<int> _targetPids = new List<int>();
@@ -722,9 +725,20 @@ namespace LolFocusGuard
                         _lastInputWhere.Length > 0 ? _lastInputWhere : "-"));
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // 轮询永不抛出
+                // 轮询永不抛出 —— 但"永不抛出"不等于"永远不该留痕"。
+                // 原来这里是空的 catch：万一某个 P/Invoke 在这台机器上一直失败，
+                // 表现就是"守卫在跑、心跳正常、但就是不拦"，而日志里一行证据都没有。
+                // 现在限频记下来（同类错误 60 秒最多一行），既不刷屏也能事后查到。
+                long nowMs = Clock.NowMs();
+                if (_pollErrorAt == Clock.Never || Clock.AgeMs(_pollErrorAt) > 60000)
+                {
+                    _pollErrorAt = nowMs;
+                    _pollErrorCount++;
+                    Log(string.Format("提示: 轮询里出过一次错（累计 {0} 次，同类错误 60 秒内只记一行）：{1}: {2}",
+                        _pollErrorCount, ex.GetType().Name, ex.Message));
+                }
             }
         }
 
